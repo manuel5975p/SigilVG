@@ -233,12 +233,25 @@ int main(int argc, char **argv)
             .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
         });
 
-    /* Encode render pass */
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
     static const float bg[] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    /* Stress test: 200 submits in one frame (well past old 100 semaphore limit) */
+    const int STRESS_SUBMITS = 200;
+    fprintf(stderr, "Stress test: %d queue submits in one frame...\n", STRESS_SUBMITS);
+    for (int i = 0; i < STRESS_SUBMITS; i++) {
+        WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
+        sigil_encode(ctx, dd, e, rtView, NULL, bg);
+        WGPUCommandBuffer c = wgpuCommandEncoderFinish(e, NULL);
+        wgpuQueueSubmit(gpu.queue, 1, &c);
+        wgpuCommandBufferRelease(c);
+        wgpuCommandEncoderRelease(e);
+    }
+    fprintf(stderr, "Stress test passed (%d submits).\n", STRESS_SUBMITS);
+
+    /* Final render + copy to readback buffer */
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
     sigil_encode(ctx, dd, enc, rtView, NULL, bg);
 
-    /* Copy render target to readback buffer */
     wgpuCommandEncoderCopyTextureToBuffer(enc,
         &(WGPUTexelCopyTextureInfo){.texture = rtTex, .aspect = WGPUTextureAspect_All},
         &(WGPUTexelCopyBufferInfo){.buffer = readBuf,

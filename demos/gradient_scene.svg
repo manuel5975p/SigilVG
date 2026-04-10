@@ -1,0 +1,40 @@
+<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="60%" stop-color="#1e3a5f"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="70%" stop-color="#f97316"/>
+      <stop offset="100%" stop-color="#f9731600"/>
+    </radialGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f97316" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Sky -->
+  <rect x="0" y="0" width="300" height="200" fill="url(#sky)"/>
+
+  <!-- Sun -->
+  <circle cx="150" cy="180" r="40" fill="url(#sun)"/>
+
+  <!-- Water -->
+  <rect x="0" y="200" width="300" height="100" fill="url(#water)"/>
+
+  <!-- Reflection shimmer -->
+  <path d="M 120 210 Q 135 208 150 210 Q 165 212 180 210" fill="none" stroke="#fbbf24" stroke-width="1.5" opacity="0.5"/>
+  <path d="M 100 230 Q 125 227 150 230 Q 175 233 200 230" fill="none" stroke="#fbbf24" stroke-width="1" opacity="0.3"/>
+  <path d="M 110 250 Q 130 248 150 250 Q 170 252 190 250" fill="none" stroke="#fbbf24" stroke-width="0.8" opacity="0.2"/>
+
+  <!-- Stars -->
+  <circle cx="40" cy="30" r="1.5" fill="white" opacity="0.8"/>
+  <circle cx="90" cy="55" r="1" fill="white" opacity="0.6"/>
+  <circle cx="200" cy="20" r="1.5" fill="white" opacity="0.7"/>
+  <circle cx="260" cy="50" r="1" fill="white" opacity="0.5"/>
+  <circle cx="270" cy="15" r="1.2" fill="white" opacity="0.9"/>
+  <circle cx="130" cy="15" r="0.8" fill="white" opacity="0.4"/>
+</svg>

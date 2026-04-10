@@ -1,0 +1,28 @@
+<svg viewBox="0 0 480 160" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="480" height="160" fill="#1e1e2e"/>
+
+  <!-- Bezier flower -->
+  <g transform="translate(80, 80)">
+    <path d="M 0 -40 Q 20 -20 0 0 Q -20 -20 0 -40" fill="#f38ba8"/>
+    <path d="M 0 -40 Q 20 -20 0 0 Q -20 -20 0 -40" fill="#fab387" transform="rotate(72)"/>
+    <path d="M 0 -40 Q 20 -20 0 0 Q -20 -20 0 -40" fill="#f9e2af" transform="rotate(144)"/>
+    <path d="M 0 -40 Q 20 -20 0 0 Q -20 -20 0 -40" fill="#a6e3a1" transform="rotate(216)"/>
+    <path d="M 0 -40 Q 20 -20 0 0 Q -20 -20 0 -40" fill="#89b4fa" transform="rotate(288)"/>
+    <circle cx="0" cy="0" r="10" fill="#cdd6f4"/>
+  </g>
+
+  <!-- Concentric rings -->
+  <g transform="translate(240, 80)">
+    <circle cx="0" cy="0" r="55" fill="none" stroke="#89b4fa" stroke-width="2"/>
+    <circle cx="0" cy="0" r="42" fill="none" stroke="#b4befe" stroke-width="2"/>
+    <circle cx="0" cy="0" r="29" fill="none" stroke="#cba6f7" stroke-width="2"/>
+    <circle cx="0" cy="0" r="16" fill="#cba6f7" opacity="0.5"/>
+    <ellipse cx="0" cy="0" rx="55" ry="25" fill="none" stroke="#f38ba8" stroke-width="1.5"/>
+  </g>
+
+  <!-- Star polygon -->
+  <g transform="translate(400, 80)">
+    <polygon points="0,-50 12,-16 50,-16 20,6 30,42 0,20 -30,42 -20,6 -50,-16 -12,-16" fill="#f9e2af" opacity="0.8"/>
+    <polygon points="0,-30 7,-10 30,-10 12,4 18,25 0,12 -18,25 -12,4 -30,-10 -7,-10" fill="#1e1e2e"/>
+  </g>
+</svg>
