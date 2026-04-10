@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SigilVG Web Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #drop-overlay {
+    position: fixed; inset: 0; z-index: 10;
+    display: none; place-items: center;
+    background: rgba(26, 26, 46, 0.85);
+    border: 4px dashed #e94560;
+    pointer-events: none;
+  }
+  #drop-overlay.active { display: grid; }
+  #drop-overlay span {
+    color: #e94560; font-size: 2rem; font-weight: 600;
+  }
+  #hint {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    color: #8888aa; font-size: 0.85rem; z-index: 5;
+    pointer-events: none; text-align: center;
+  }
+  #status {
+    position: fixed; top: 16px; left: 16px;
+    color: #e94560; font-size: 0.85rem; z-index: 5;
+    pointer-events: none; opacity: 0; transition: opacity 0.3s;
+  }
+  #status.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="drop-overlay"><span>Drop SVG here</span></div>
+  <div id="hint">Drag &amp; drop an SVG file onto this page &mdash; scroll to zoom, right-drag to pan</div>
+  <div id="status"></div>
+
+  <script>
+    // --- Drag-and-drop handling ---
+    var dragCounter = 0;
+    var overlay = document.getElementById('drop-overlay');
+    var statusEl = document.getElementById('status');
+
+    function showStatus(msg) {
+      statusEl.textContent = msg;
+      statusEl.classList.add('show');
+      setTimeout(function() { statusEl.classList.remove('show'); }, 2000);
+    }
+
+    document.addEventListener('dragenter', function(e) {
+      e.preventDefault();
+      dragCounter++;
+      overlay.classList.add('active');
+    });
+    document.addEventListener('dragleave', function(e) {
+      e.preventDefault();
+      dragCounter--;
+      if (dragCounter <= 0) { dragCounter = 0; overlay.classList.remove('active'); }
+    });
+    document.addEventListener('dragover', function(e) { e.preventDefault(); });
+    document.addEventListener('drop', function(e) {
+      e.preventDefault();
+      dragCounter = 0;
+      overlay.classList.remove('active');
+
+      var files = e.dataTransfer.files;
+      for (var i = 0; i < files.length; i++) {
+        if (files[i].name.endsWith('.svg')) {
+          var file = files[i];
+          var reader = new FileReader();
+          reader.onload = (function(fname) {
+            return function(ev) {
+              var svgText = ev.target.result;
+              if (typeof Module !== 'undefined' && Module.ccall) {
+                Module.ccall('web_demo_load_svg', 'number',
+                             ['string', 'number'], [svgText, svgText.length]);
+                showStatus('Loaded: ' + fname);
+              }
+            };
+          })(file.name);
+          reader.readAsText(file);
+          break;
+        }
+      }
+    });
+  </script>
+
+  <script>
+    // Resize GLFW canvas to fill viewport
+    function resizeCanvas() {
+      var c = document.getElementById('canvas');
+      if (c) {
+        c.width = window.innerWidth;
+        c.height = window.innerHeight;
+      }
+    }
+    window.addEventListener('resize', resizeCanvas);
+    window.addEventListener('load', resizeCanvas);
+  </script>
+
+  {{{ SCRIPT }}}
+</body>
+</html>
