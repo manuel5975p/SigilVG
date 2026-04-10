@@ -37,6 +37,7 @@ typedef enum {
 typedef struct SigilContext  SigilContext;
 typedef struct SigilScene    SigilScene;
 typedef struct SigilDrawData SigilDrawData;
+typedef struct SigilGPUScene SigilGPUScene;
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                        */
@@ -46,10 +47,6 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
                            WGPUTextureFormat depthFormat);
 
 SigilScene* sigil_parse_svg(const char* svg_data, size_t len);
-
-SigilDrawData* sigil_prepare(SigilContext* ctx, SigilScene* scene,
-                             float viewport_w, float viewport_h,
-                             bool depth_buffering);
 
 /* If clear_color is non-NULL, the render pass clears to that color.
    If NULL, LoadOp_Load is used (caller must have already cleared). */
@@ -62,6 +59,14 @@ void sigil_encode(SigilContext* ctx, SigilDrawData* data,
 void sigil_free_draw_data(SigilDrawData* data);
 void sigil_free_scene(SigilScene* scene);
 void sigil_destroy(SigilContext* ctx);
+
+/* GPU compute path */
+SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene);
+void           sigil_free_gpu_scene(SigilGPUScene* gpu_scene);
+
+SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gpu_scene,
+                                 WGPUCommandEncoder encoder,
+                                 float viewport_w, float viewport_h);
 
 /* Load a font for <text> rendering. Font data must remain valid until
    sigil_free_scene(). family_name is matched against font-family in SVG.
@@ -198,36 +203,17 @@ static void sigil__resolve_gradient_hrefs(SigilGradientArray *arr) {
     }
 }
 
-/* Bake a gradient into a 256-pixel RGBA ramp (uint8, for RGBA8Unorm texture) */
-static void sigil__bake_gradient_ramp(const SigilGradientDef *g, uint8_t *ramp) {
-    float color[4];
-    for (int i = 0; i < SIGIL_GRADIENT_RAMP_WIDTH; i++) {
-        if (g->stop_count == 0) {
-            color[0] = color[1] = color[2] = color[3] = 0.0f;
-        } else if (g->stop_count == 1) {
-            memcpy(color, g->stops[0].color, sizeof(color));
-        } else {
-            float t = (float)i / (float)(SIGIL_GRADIENT_RAMP_WIDTH - 1);
-            int lo = 0, hi = g->stop_count - 1;
-            for (int s = 0; s < g->stop_count - 1; s++) {
-                if (t >= g->stops[s].offset && t <= g->stops[s+1].offset) {
-                    lo = s; hi = s + 1; break;
-                }
-            }
-            if (t <= g->stops[0].offset) { lo = hi = 0; }
-            if (t >= g->stops[g->stop_count-1].offset) { lo = hi = g->stop_count - 1; }
-            float seg = g->stops[hi].offset - g->stops[lo].offset;
-            float u = (seg > 1e-6f) ? (t - g->stops[lo].offset) / seg : 0.0f;
-            u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
-            for (int c = 0; c < 4; c++)
-                color[c] = g->stops[lo].color[c] * (1.0f - u) + g->stops[hi].color[c] * u;
-        }
-        for (int c = 0; c < 4; c++) {
-            float v = color[c] < 0.0f ? 0.0f : (color[c] > 1.0f ? 1.0f : color[c]);
-            ramp[i*4+c] = (uint8_t)(v * 255.0f + 0.5f);
-        }
-    }
-}
+typedef enum {
+    SIGIL_JOIN_MITER = 0, /* SVG default */
+    SIGIL_JOIN_ROUND = 1,
+    SIGIL_JOIN_BEVEL = 2,
+} SigilLineJoin;
+
+typedef enum {
+    SIGIL_CAP_BUTT   = 0, /* SVG default */
+    SIGIL_CAP_ROUND  = 1,
+    SIGIL_CAP_SQUARE = 2,
+} SigilLineCap;
 
 typedef struct {
     SigilCurve *curves;
@@ -241,6 +227,9 @@ typedef struct {
     SigilBounds bounds;       /* after transform */
     SigilBandData bands;      /* after transform */
     int         fill_gradient_idx; /* index into scene->gradients, or -1 */
+    SigilLineJoin  stroke_linejoin;
+    SigilLineCap   stroke_linecap;
+    float          stroke_miterlimit;
 } SigilElement;
 
 struct SigilScene {
@@ -257,18 +246,12 @@ struct SigilScene {
 };
 
 struct SigilDrawData {
-    WGPUBuffer      vertexBuffer;
-    WGPUBuffer      indexBuffer;
-    WGPUBuffer      uniformBuffer;
-    WGPUTexture     curveTexture;
-    WGPUTexture     bandTexture;
-    WGPUTextureView curveView;
-    WGPUTextureView bandView;
-    WGPUTexture     gradientTexture;
-    WGPUTextureView gradientView;
-    WGPUSampler     gradientSampler;
-    WGPUBindGroup   bindGroup;
-    int             indexCount;
+    WGPUBuffer    uniformBuffer;    /* 80-byte UBO (owned) */
+    WGPUBindGroup renderBindGroup;  /* references gpu_scene buffers (owned) */
+    uint32_t      indexCount;
+    /* Back-references for sigil_encode (not owned, point into SigilGPUScene) */
+    WGPUBuffer    vertexBuf;
+    WGPUBuffer    indexBuf;
 };
 
 struct SigilContext {
@@ -276,11 +259,64 @@ struct SigilContext {
     WGPUQueue           queue;
     WGPUTextureFormat   colorFormat;
     WGPUTextureFormat   depthFormat;
+    /* Render pipeline */
     WGPURenderPipeline  pipeline;
-    WGPUBindGroupLayout bindGroupLayout;
-    WGPUPipelineLayout  pipelineLayout;
+    WGPUBindGroupLayout renderBGL;
+    WGPUPipelineLayout  renderPipelineLayout;
     WGPUShaderModule    vertexShader;
     WGPUShaderModule    fragmentShader;
+    /* Compute pipelines */
+    WGPUComputePipeline preparePipeline;
+    WGPUComputePipeline gradientPipeline;
+    WGPUBindGroupLayout prepareInputBGL;   /* group(0): scene data (read) */
+    WGPUBindGroupLayout prepareOutputBGL;  /* group(1): output buffers (rw) */
+    WGPUPipelineLayout  preparePipelineLayout;
+    WGPUBindGroupLayout gradientBGL;
+    WGPUPipelineLayout  gradientPipelineLayout;
+    WGPUShaderModule    prepareShader;
+    WGPUShaderModule    gradientShader;
+    /* Shared */
+    WGPUSampler         gradientSampler;
+};
+
+struct SigilGPUScene {
+    /* Input buffers (written once by sigil_upload) */
+    WGPUBuffer curvesBuf;
+    WGPUBuffer elementsBuf;
+    WGPUBuffer offsetsBuf;
+    WGPUBuffer gradientsBuf;       /* NULL if no gradients */
+    WGPUBuffer gradientStopsBuf;   /* NULL if no gradients */
+    WGPUBuffer viewportBuf;        /* 32-byte uniform, written per-prepare */
+
+    /* Output buffers (allocated once, written by compute each prepare) */
+    WGPUBuffer curveBuf;           /* packed curve data for fragment shader */
+    WGPUBuffer bandBuf;            /* packed band data for fragment shader */
+    WGPUBuffer vertexBuf;          /* vertex buffer (also Storage for compute write) */
+    WGPUBuffer indexBuf;           /* index buffer (also Storage for compute write) */
+    WGPUBuffer gradientRampBuf;    /* gradient ramp staging (copied to texture) */
+
+    /* Gradient ramp texture (RGBA8Unorm, for linear-filtered sampling) */
+    WGPUTexture     gradientTexture;
+    WGPUTextureView gradientView;
+
+    /* Compute bind groups */
+    WGPUBindGroup prepareInputBG;
+    WGPUBindGroup prepareOutputBG;
+    WGPUBindGroup gradientBG;      /* NULL if no gradients */
+
+    /* CPU-side metadata for dispatch sizing and prepare_gpu */
+    uint32_t elementCount;
+    uint32_t totalCurves;
+    uint32_t gradientCount;
+    float    viewBox[4];           /* x, y, w, h -- copied from SigilScene */
+    bool     hasViewBox;
+
+    /* CPU-side copies for CPU prepare path (compute shader fallback) */
+    uint32_t *cpuElemData;         /* 22 u32/f32 per element */
+    uint32_t *cpuOffsetData;       /* 2 u32 per element: curve_start, band_start */
+    float    *cpuCurvesData;       /* 6 floats per curve */
+    uint32_t  curveOutVec4s;       /* total vec4s in curveBuf */
+    uint32_t  bandOutVec4s;        /* total vec4s in bandBuf */
 };
 
 /* ------------------------------------------------------------------ */
@@ -1472,8 +1508,239 @@ static void sigil__flatten_quad(float p0x, float p0y,
     sigil__flatten_quad(midx, midy, m12x, m12y, p2x, p2y, pts, npts, cap);
 }
 
+/* Push a point into a growable float-pair array */
+static void sigil__pts_push(float **pts, int *npts, int *ptcap, float x, float y) {
+    if (*npts >= *ptcap) {
+        *ptcap = *ptcap ? *ptcap * 2 : 64;
+        *pts = (float *)realloc(*pts, (size_t)(*ptcap) * 2 * sizeof(float));
+    }
+    (*pts)[(*npts) * 2]     = x;
+    (*pts)[(*npts) * 2 + 1] = y;
+    (*npts)++;
+}
+
+/* ---- Join geometry helpers ---- */
+
+static void sigil__join_bevel(SigilCurveArray *arr,
+                               float o0x, float o0y,
+                               float o1x, float o1y) {
+    sigil__curve_array_push(arr, sigil__line_to_quad(o0x, o0y, o1x, o1y));
+}
+
+static void sigil__join_miter(SigilCurveArray *arr,
+                               float vx, float vy,
+                               float n0x, float n0y,
+                               float n1x, float n1y,
+                               float half, float mlimit,
+                               int outer_is_left) {
+    float sign = outer_is_left ? 1.0f : -1.0f;
+    float o0x = vx + sign * n0x * half, o0y = vy + sign * n0y * half;
+    float o1x = vx + sign * n1x * half, o1y = vy + sign * n1y * half;
+
+    float dot_n = n0x * n1x + n0y * n1y;
+    float denom = 1.0f + dot_n;
+
+    if (denom < 1e-6f) {
+        /* Near-180-degree turn: bevel fallback */
+        sigil__join_bevel(arr, o0x, o0y, o1x, o1y);
+        return;
+    }
+
+    /* Miter limit check: miter_ratio = 1/sin(theta/2),
+       sin^2(theta/2) = (1 - dot_n)/2 */
+    float sin2_half = (1.0f - dot_n) * 0.5f;
+    float limit_sq = mlimit * mlimit;
+    if (sin2_half > 1e-10f && (1.0f / sin2_half) > limit_sq) {
+        sigil__join_bevel(arr, o0x, o0y, o1x, o1y);
+        return;
+    }
+
+    /* Miter point: V + sign * (n0+n1)/(1+dot(n0,n1)) * half */
+    float mx = vx + sign * (n0x + n1x) / denom * half;
+    float my = vy + sign * (n0y + n1y) / denom * half;
+    sigil__curve_array_push(arr, sigil__line_to_quad(o0x, o0y, mx, my));
+    sigil__curve_array_push(arr, sigil__line_to_quad(mx, my, o1x, o1y));
+}
+
+static void sigil__join_round(SigilCurveArray *arr,
+                               float vx, float vy,
+                               float n0x, float n0y,
+                               float n1x, float n1y,
+                               float half,
+                               int outer_is_left) {
+    float sign = outer_is_left ? 1.0f : -1.0f;
+    float o0x = vx + sign * n0x * half, o0y = vy + sign * n0y * half;
+
+    float dot_n = n0x * n1x + n0y * n1y;
+    float cross_n = n0x * n1y - n0y * n1x;
+    /* Angle between the two offset directions (on the outer side) */
+    float theta = atan2f(sign * cross_n, dot_n);
+    /* We want the arc swept on the outer side (reflex direction) */
+    if (outer_is_left) {
+        if (theta < 0) theta += 2.0f * 3.14159265f;
+    } else {
+        if (theta > 0) theta -= 2.0f * 3.14159265f;
+    }
+
+    float abs_theta = fabsf(theta);
+    if (abs_theta < 1e-4f) {
+        float o1x = vx + sign * n1x * half, o1y = vy + sign * n1y * half;
+        sigil__curve_array_push(arr, sigil__line_to_quad(o0x, o0y, o1x, o1y));
+        return;
+    }
+
+    /* Split arc into sub-arcs of at most 90 degrees */
+    int n_arcs = (int)ceilf(abs_theta / (3.14159265f * 0.5f));
+    if (n_arcs < 1) n_arcs = 1;
+    float step = theta / (float)n_arcs;
+
+    float angle0 = atan2f(sign * n0y, sign * n0x);
+    float prev_px = o0x, prev_py = o0y;
+
+    for (int k = 0; k < n_arcs; k++) {
+        float a1 = angle0 + (float)(k + 1) * step;
+        float ex = vx + half * cosf(a1);
+        float ey = vy + half * sinf(a1);
+
+        /* Control point: push outward along bisector of this sub-arc */
+        float a_mid = angle0 + ((float)k + 0.5f) * step;
+        float cos_hs = cosf(step * 0.5f);
+        if (fabsf(cos_hs) < 1e-6f) cos_hs = (cos_hs < 0) ? -1e-6f : 1e-6f;
+        float qr = half / cos_hs;
+        float qx = vx + qr * cosf(a_mid);
+        float qy = vy + qr * sinf(a_mid);
+
+        SigilCurve c;
+        c.p0x = prev_px; c.p0y = prev_py;
+        c.p1x = qx;      c.p1y = qy;
+        c.p2x = ex;       c.p2y = ey;
+        sigil__curve_array_push(arr, c);
+
+        prev_px = ex; prev_py = ey;
+    }
+}
+
+/* Dispatcher for join geometry on the outer side of a vertex */
+static void sigil__emit_join(SigilCurveArray *arr, SigilLineJoin join,
+                              float vx, float vy,
+                              float n0x, float n0y,
+                              float n1x, float n1y,
+                              float half, float mlimit,
+                              int outer_is_left) {
+    switch (join) {
+    case SIGIL_JOIN_BEVEL: {
+        float sign = outer_is_left ? 1.0f : -1.0f;
+        float o0x = vx + sign * n0x * half, o0y = vy + sign * n0y * half;
+        float o1x = vx + sign * n1x * half, o1y = vy + sign * n1y * half;
+        sigil__join_bevel(arr, o0x, o0y, o1x, o1y);
+        break;
+    }
+    case SIGIL_JOIN_ROUND:
+        sigil__join_round(arr, vx, vy, n0x, n0y, n1x, n1y, half, outer_is_left);
+        break;
+    default: /* SIGIL_JOIN_MITER */
+        sigil__join_miter(arr, vx, vy, n0x, n0y, n1x, n1y, half, mlimit, outer_is_left);
+        break;
+    }
+}
+
+/* ---- Cap geometry helpers ---- */
+
+static void sigil__cap_butt(SigilCurveArray *arr,
+                             float lx, float ly, float rx, float ry) {
+    sigil__curve_array_push(arr, sigil__line_to_quad(lx, ly, rx, ry));
+}
+
+static void sigil__cap_square(SigilCurveArray *arr,
+                               float lx, float ly, float rx, float ry,
+                               float tx, float ty, float half) {
+    /* Extend both offset points along the tangent direction */
+    float elx = lx + tx * half, ely = ly + ty * half;
+    float erx = rx + tx * half, ery = ry + ty * half;
+    sigil__curve_array_push(arr, sigil__line_to_quad(lx, ly, elx, ely));
+    sigil__curve_array_push(arr, sigil__line_to_quad(elx, ely, erx, ery));
+    sigil__curve_array_push(arr, sigil__line_to_quad(erx, ery, rx, ry));
+}
+
+static void sigil__cap_round(SigilCurveArray *arr,
+                              float vx, float vy,
+                              float nx, float ny,
+                              float half, int is_start) {
+    /* Semicircle: CW arc (sweep = -pi) bulging outward from the path endpoint.
+       End cap:   left  -> forward -> right  (outward = tangent direction)
+       Start cap: right -> backward -> left  (outward = -tangent direction) */
+    float a_start;
+    if (is_start) {
+        a_start = atan2f(-ny, -nx); /* start from right side */
+    } else {
+        a_start = atan2f(ny, nx);   /* start from left side */
+    }
+    float a_end = a_start - 3.14159265f; /* CW sweep */
+
+    /* Two 90-degree quadratic arcs */
+    float step = (a_end - a_start) * 0.5f; /* -pi/2 each */
+    float cos_hs = cosf(step * 0.5f);
+    if (fabsf(cos_hs) < 1e-6f) cos_hs = 1e-6f;
+    float qr = half / cos_hs;
+
+    float prev_px = vx + half * cosf(a_start);
+    float prev_py = vy + half * sinf(a_start);
+
+    for (int k = 0; k < 2; k++) {
+        float a1 = a_start + (float)(k + 1) * step;
+        float a_mid = a_start + ((float)k + 0.5f) * step;
+        float ex = vx + half * cosf(a1);
+        float ey = vy + half * sinf(a1);
+        float qx = vx + qr * cosf(a_mid);
+        float qy = vy + qr * sinf(a_mid);
+        SigilCurve c = { prev_px, prev_py, qx, qy, ex, ey };
+        sigil__curve_array_push(arr, c);
+        prev_px = ex; prev_py = ey;
+    }
+}
+
+/* Dispatcher for cap geometry */
+static void sigil__emit_cap(SigilCurveArray *arr, SigilLineCap capstyle,
+                             float vx, float vy,
+                             float nx, float ny,
+                             float tx, float ty,
+                             float half, int is_start) {
+    float lx = vx + nx * half, ly = vy + ny * half;
+    float rx = vx - nx * half, ry = vy - ny * half;
+    switch (capstyle) {
+    case SIGIL_CAP_SQUARE:
+        if (is_start)
+            sigil__cap_square(arr, rx, ry, lx, ly, -tx, -ty, half);
+        else
+            sigil__cap_square(arr, lx, ly, rx, ry, tx, ty, half);
+        break;
+    case SIGIL_CAP_ROUND:
+        sigil__cap_round(arr, vx, vy, nx, ny, half, is_start);
+        break;
+    default: /* SIGIL_CAP_BUTT */
+        if (is_start)
+            sigil__cap_butt(arr, rx, ry, lx, ly);
+        else
+            sigil__cap_butt(arr, lx, ly, rx, ry);
+        break;
+    }
+}
+
+/* ---- Inner join: route through vertex to avoid self-intersection ---- */
+static void sigil__inner_join(SigilCurveArray *arr,
+                               float vx, float vy,
+                               float ipx, float ipy,
+                               float inx, float iny) {
+    sigil__curve_array_push(arr, sigil__line_to_quad(ipx, ipy, vx, vy));
+    sigil__curve_array_push(arr, sigil__line_to_quad(vx, vy, inx, iny));
+}
+
+/* ================================================================== */
+
 static int sigil__stroke_to_fill(SigilCurve *curves, int count,
                                   float stroke_width,
+                                  SigilLineJoin join, SigilLineCap capstyle,
+                                  float miter_limit,
                                   SigilCurve **out, SigilBounds *bounds) {
     if (count == 0 || stroke_width <= 0) {
         *out = NULL;
@@ -1486,94 +1753,202 @@ static int sigil__stroke_to_fill(SigilCurve *curves, int count,
     SigilCurveArray arr;
     sigil__curve_array_init(&arr);
 
-    for (int i = 0; i < count; i++) {
-        SigilCurve *c = &curves[i];
+    /* --- Detect subpath boundaries --- */
+    int *sp_starts = (int *)malloc((size_t)(count + 1) * sizeof(int));
+    int num_sp = 0;
+    sp_starts[num_sp++] = 0;
+    for (int i = 1; i < count; i++) {
+        float dx = curves[i].p0x - curves[i-1].p2x;
+        float dy = curves[i].p0y - curves[i-1].p2y;
+        if (dx*dx + dy*dy > 1e-6f)
+            sp_starts[num_sp++] = i;
+    }
+    sp_starts[num_sp] = count; /* sentinel */
 
-        /* Flatten quadratic curve to polyline */
+    /* --- Process each subpath --- */
+    for (int sp = 0; sp < num_sp; sp++) {
+        int sp_begin = sp_starts[sp];
+        int sp_end   = sp_starts[sp + 1];
+
+        /* 1. Flatten all curves of this subpath into one polyline */
         float *pts = NULL;
-        int npts = 0, cap = 0;
+        int npts = 0, ptcap = 0;
 
-        /* Add start point */
-        if (npts >= cap) { cap = 64; pts = (float *)malloc((size_t)cap * 2 * sizeof(float)); }
-        pts[0] = c->p0x; pts[1] = c->p0y; npts = 1;
+        sigil__pts_push(&pts, &npts, &ptcap,
+                        curves[sp_begin].p0x, curves[sp_begin].p0y);
+        for (int i = sp_begin; i < sp_end; i++) {
+            sigil__flatten_quad(curves[i].p0x, curves[i].p0y,
+                                curves[i].p1x, curves[i].p1y,
+                                curves[i].p2x, curves[i].p2y,
+                                &pts, &npts, &ptcap);
+        }
 
-        sigil__flatten_quad(c->p0x, c->p0y, c->p1x, c->p1y,
-                            c->p2x, c->p2y, &pts, &npts, &cap);
+        /* Remove consecutive duplicate points */
+        {
+            int w = 1;
+            for (int r = 1; r < npts; r++) {
+                float ddx = pts[r*2] - pts[(w-1)*2];
+                float ddy = pts[r*2+1] - pts[(w-1)*2+1];
+                if (ddx*ddx + ddy*ddy > 1e-10f) {
+                    pts[w*2]   = pts[r*2];
+                    pts[w*2+1] = pts[r*2+1];
+                    w++;
+                }
+            }
+            npts = w;
+        }
 
+        /* 2. Detect closure */
+        int is_closed = 0;
+        if (npts >= 3) {
+            float dcx = pts[0] - pts[(npts-1)*2];
+            float dcy = pts[1] - pts[(npts-1)*2+1];
+            if (dcx*dcx + dcy*dcy < 1e-4f) {
+                is_closed = 1;
+                npts--; /* remove duplicate closing point */
+            }
+        }
         if (npts < 2) { free(pts); continue; }
 
-        /* Compute normals at each point (average of adjacent segment normals) */
-        float *nx = (float *)malloc((size_t)npts * sizeof(float));
-        float *ny = (float *)malloc((size_t)npts * sizeof(float));
+        int nseg = is_closed ? npts : npts - 1;
 
-        for (int j = 0; j < npts; j++) {
-            float avgNx = 0, avgNy = 0;
-            int nn = 0;
-            /* Previous segment normal */
-            if (j > 0) {
-                float sdx = pts[j*2] - pts[(j-1)*2];
-                float sdy = pts[j*2+1] - pts[(j-1)*2+1];
-                float slen = sqrtf(sdx*sdx + sdy*sdy);
-                if (slen > 1e-12f) {
-                    avgNx += -sdy / slen; avgNy += sdx / slen; nn++;
+        /* 3. Compute per-segment tangent and normal */
+        float *seg_tx = (float *)malloc((size_t)nseg * sizeof(float));
+        float *seg_ty = (float *)malloc((size_t)nseg * sizeof(float));
+        float *seg_nx = (float *)malloc((size_t)nseg * sizeof(float));
+        float *seg_ny = (float *)malloc((size_t)nseg * sizeof(float));
+
+        for (int s = 0; s < nseg; s++) {
+            int i0 = s;
+            int i1 = (s + 1) % npts;
+            float tdx = pts[i1*2] - pts[i0*2];
+            float tdy = pts[i1*2+1] - pts[i0*2+1];
+            float tlen = sqrtf(tdx*tdx + tdy*tdy);
+            if (tlen < 1e-12f) tlen = 1e-12f;
+            seg_tx[s] = tdx / tlen;
+            seg_ty[s] = tdy / tlen;
+            seg_nx[s] = -seg_ty[s]; /* 90-degree CCW rotation */
+            seg_ny[s] =  seg_tx[s];
+        }
+
+        /* 4. Generate stroke outline contour.
+           Forward pass (left offset side), then backward pass (right offset side).
+           Joins are emitted at each interior vertex. */
+
+        /* --- Forward pass: left side --- */
+        for (int s = 0; s < nseg; s++) {
+            int i0 = s;
+            int i1 = (s + 1) % npts;
+
+            /* Start cap at the beginning of an open path */
+            if (s == 0 && !is_closed) {
+                sigil__emit_cap(&arr, capstyle,
+                                pts[0], pts[1],
+                                seg_nx[0], seg_ny[0],
+                                seg_tx[0], seg_ty[0],
+                                half, 1);
+            }
+
+            /* Left offset edge for segment s */
+            float l0x = pts[i0*2]   + seg_nx[s] * half;
+            float l0y = pts[i0*2+1] + seg_ny[s] * half;
+            float l1x = pts[i1*2]   + seg_nx[s] * half;
+            float l1y = pts[i1*2+1] + seg_ny[s] * half;
+            sigil__curve_array_push(&arr, sigil__line_to_quad(l0x, l0y, l1x, l1y));
+
+            /* Join at vertex i1 to next segment */
+            int need_join = 0;
+            int s_next = -1;
+            if (is_closed) {
+                need_join = 1;
+                s_next = (s + 1) % nseg;
+            } else if (s < nseg - 1) {
+                need_join = 1;
+                s_next = s + 1;
+            }
+
+            if (need_join) {
+                float cross = seg_tx[s] * seg_ty[s_next] - seg_ty[s] * seg_tx[s_next];
+
+                if (cross < -1e-6f) {
+                    /* Right turn: LEFT side is outer */
+                    sigil__emit_join(&arr, join,
+                                     pts[i1*2], pts[i1*2+1],
+                                     seg_nx[s], seg_ny[s],
+                                     seg_nx[s_next], seg_ny[s_next],
+                                     half, miter_limit, 1);
+                } else if (cross > 1e-6f) {
+                    /* Left turn: left side is inner — route through vertex */
+                    float ipx = pts[i1*2] + seg_nx[s] * half;
+                    float ipy = pts[i1*2+1] + seg_ny[s] * half;
+                    float inx = pts[i1*2] + seg_nx[s_next] * half;
+                    float iny = pts[i1*2+1] + seg_ny[s_next] * half;
+                    sigil__inner_join(&arr, pts[i1*2], pts[i1*2+1],
+                                     ipx, ipy, inx, iny);
+                }
+                /* else collinear: points naturally contiguous */
+            }
+
+            /* End cap at the end of an open path */
+            if (s == nseg - 1 && !is_closed) {
+                int last = is_closed ? (s + 1) % npts : npts - 1;
+                sigil__emit_cap(&arr, capstyle,
+                                pts[last*2], pts[last*2+1],
+                                seg_nx[s], seg_ny[s],
+                                seg_tx[s], seg_ty[s],
+                                half, 0);
+            }
+        }
+
+        /* --- Backward pass: right side --- */
+        for (int s = nseg - 1; s >= 0; s--) {
+            int i0 = s;
+            int i1 = (s + 1) % npts;
+
+            /* Right offset edge backward: from i1 to i0 */
+            float r1x = pts[i1*2]   - seg_nx[s] * half;
+            float r1y = pts[i1*2+1] - seg_ny[s] * half;
+            float r0x = pts[i0*2]   - seg_nx[s] * half;
+            float r0y = pts[i0*2+1] - seg_ny[s] * half;
+            sigil__curve_array_push(&arr, sigil__line_to_quad(r1x, r1y, r0x, r0y));
+
+            /* Join at vertex i0 to the previous segment */
+            int need_join = 0;
+            int s_prev = -1;
+            if (is_closed) {
+                need_join = 1;
+                s_prev = (s - 1 + nseg) % nseg;
+            } else if (s > 0) {
+                need_join = 1;
+                s_prev = s - 1;
+            }
+
+            if (need_join) {
+                float cross = seg_tx[s_prev] * seg_ty[s] - seg_ty[s_prev] * seg_tx[s];
+
+                if (cross > 1e-6f) {
+                    /* Left turn: RIGHT side is outer */
+                    sigil__emit_join(&arr, join,
+                                     pts[i0*2], pts[i0*2+1],
+                                     seg_nx[s_prev], seg_ny[s_prev],
+                                     seg_nx[s], seg_ny[s],
+                                     half, miter_limit, 0);
+                } else if (cross < -1e-6f) {
+                    /* Right turn: right side is inner — route through vertex */
+                    float ipx = pts[i0*2] - seg_nx[s_prev] * half;
+                    float ipy = pts[i0*2+1] - seg_ny[s_prev] * half;
+                    float inx = pts[i0*2] - seg_nx[s] * half;
+                    float iny = pts[i0*2+1] - seg_ny[s] * half;
+                    sigil__inner_join(&arr, pts[i0*2], pts[i0*2+1],
+                                     ipx, ipy, inx, iny);
                 }
             }
-            /* Next segment normal */
-            if (j < npts - 1) {
-                float sdx = pts[(j+1)*2] - pts[j*2];
-                float sdy = pts[(j+1)*2+1] - pts[j*2+1];
-                float slen = sqrtf(sdx*sdx + sdy*sdy);
-                if (slen > 1e-12f) {
-                    avgNx += -sdy / slen; avgNy += sdx / slen; nn++;
-                }
-            }
-            if (nn > 0) {
-                float nlen = sqrtf(avgNx*avgNx + avgNy*avgNy);
-                if (nlen > 1e-12f) {
-                    nx[j] = avgNx / nlen;
-                    ny[j] = avgNy / nlen;
-                } else {
-                    nx[j] = 0; ny[j] = 0;
-                }
-            } else {
-                nx[j] = 0; ny[j] = 0;
-            }
         }
 
-        /* Build stroke outline: left side forward, right side backward */
-        /* Left side: pts[j] + normal * half */
-        /* Right side: pts[j] - normal * half */
-        float *left  = (float *)malloc((size_t)npts * 2 * sizeof(float));
-        float *right = (float *)malloc((size_t)npts * 2 * sizeof(float));
-        for (int j = 0; j < npts; j++) {
-            left[j*2]    = pts[j*2]   + nx[j] * half;
-            left[j*2+1]  = pts[j*2+1] + ny[j] * half;
-            right[j*2]   = pts[j*2]   - nx[j] * half;
-            right[j*2+1] = pts[j*2+1] - ny[j] * half;
-        }
-
-        /* Emit closed contour: left[0]->left[1]->...->left[n-1]->
-           right[n-1]->right[n-2]->...->right[0]->left[0] */
-        /* Forward along left side */
-        for (int j = 0; j < npts - 1; j++) {
-            sigil__curve_array_push(&arr, sigil__line_to_quad(
-                left[j*2], left[j*2+1], left[(j+1)*2], left[(j+1)*2+1]));
-        }
-        /* End cap: left[n-1] -> right[n-1] */
-        sigil__curve_array_push(&arr, sigil__line_to_quad(
-            left[(npts-1)*2], left[(npts-1)*2+1],
-            right[(npts-1)*2], right[(npts-1)*2+1]));
-        /* Backward along right side */
-        for (int j = npts - 1; j > 0; j--) {
-            sigil__curve_array_push(&arr, sigil__line_to_quad(
-                right[j*2], right[j*2+1], right[(j-1)*2], right[(j-1)*2+1]));
-        }
-        /* Start cap: right[0] -> left[0] */
-        sigil__curve_array_push(&arr, sigil__line_to_quad(
-            right[0], right[1], left[0], left[1]));
-
-        free(pts); free(nx); free(ny); free(left); free(right);
+        free(pts); free(seg_tx); free(seg_ty); free(seg_nx); free(seg_ny);
     }
+
+    free(sp_starts);
 
     /* Compute bounds */
     bounds->xMin = FLT_MAX; bounds->yMin = FLT_MAX;
@@ -1618,6 +1993,7 @@ static SigilElement* sigil__elem_array_push(SigilElemArray *a) {
     e->opacity = 1.0f;
     e->fill_color[3] = 1.0f;
     e->fill_gradient_idx = -1;
+    e->stroke_miterlimit = 4.0f;
     return e;
 }
 
@@ -2087,6 +2463,8 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 xform_depth++;
                 sigil__mat_multiply(xform_stack[xform_depth - 1], local,
                                     xform_stack[xform_depth]);
+                g_style_stack[xform_depth] = tag.attrs;
+                g_style_len_stack[xform_depth] = tag.attrs_len;
             }
             if (tag.self_close && xform_depth > 0) xform_depth--;
             continue;
@@ -2280,6 +2658,56 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 fill_rule = SIGIL_FILL_EVENODD;
         }
 
+        /* stroke-linejoin: element, then group inheritance */
+        SigilLineJoin line_join = SIGIL_JOIN_MITER;
+        {
+            const char *lj_val;
+            int lj_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-linejoin", &lj_val);
+            if (lj_len == 0) {
+                for (int gi = xform_depth; gi >= 0 && lj_len == 0; gi--) {
+                    if (g_style_stack[gi])
+                        lj_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stroke-linejoin", &lj_val);
+                }
+            }
+            if (lj_len == 5 && memcmp(lj_val, "round", 5) == 0)
+                line_join = SIGIL_JOIN_ROUND;
+            else if (lj_len == 5 && memcmp(lj_val, "bevel", 5) == 0)
+                line_join = SIGIL_JOIN_BEVEL;
+        }
+
+        /* stroke-linecap: element, then group inheritance */
+        SigilLineCap line_cap = SIGIL_CAP_BUTT;
+        {
+            const char *lc_val;
+            int lc_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-linecap", &lc_val);
+            if (lc_len == 0) {
+                for (int gi = xform_depth; gi >= 0 && lc_len == 0; gi--) {
+                    if (g_style_stack[gi])
+                        lc_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stroke-linecap", &lc_val);
+                }
+            }
+            if (lc_len == 5 && memcmp(lc_val, "round", 5) == 0)
+                line_cap = SIGIL_CAP_ROUND;
+            else if (lc_len == 6 && memcmp(lc_val, "square", 6) == 0)
+                line_cap = SIGIL_CAP_SQUARE;
+        }
+
+        /* stroke-miterlimit: element, then group inheritance */
+        float miter_limit = 4.0f;
+        {
+            miter_limit = sigil__get_prop_float(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-miterlimit", 0);
+            if (miter_limit == 0) {
+                for (int gi = xform_depth; gi >= 0; gi--) {
+                    if (g_style_stack[gi]) {
+                        miter_limit = sigil__get_attr_float(g_style_stack[gi], g_style_len_stack[gi], "stroke-miterlimit", 0);
+                        if (miter_limit != 0) break;
+                    }
+                }
+                if (miter_limit == 0) miter_limit = 4.0f;
+            }
+            if (miter_limit < 1.0f) miter_limit = 1.0f; /* SVG spec minimum */
+        }
+
         /* Get element transform (transform is not a CSS property, only an attribute) */
         float elem_xform[6];
         const char *etr;
@@ -2325,6 +2753,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             SigilCurve *stroke_curves = NULL;
             SigilBounds stroke_bounds;
             int sc = sigil__stroke_to_fill(curves, curve_count, stroke_width,
+                                            line_join, line_cap, miter_limit,
                                             &stroke_curves, &stroke_bounds);
             free(curves);
             curves = stroke_curves;
@@ -2361,7 +2790,8 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             SigilCurve *stroke_curves = NULL;
             SigilBounds stroke_bounds;
             int sc = sigil__stroke_to_fill(fillElem->curves, (int)fillElem->curve_count,
-                                            stroke_width, &stroke_curves, &stroke_bounds);
+                                            stroke_width, line_join, line_cap, miter_limit,
+                                            &stroke_curves, &stroke_bounds);
             if (sc > 0) {
                 SigilElement *se = sigil__elem_array_push(&elems);
                 se->curves = stroke_curves;
@@ -2420,16 +2850,6 @@ static void sigil__sort_band(SigilBandEntry *band, SigilCurve *curves, int axis)
     qsort(e, (size_t)n, sizeof *e, sigil__cmp_desc);
     for (int i = 0; i < n; i++) band->curveIndices[i] = e[i].idx;
     free(e);
-}
-
-/* ------------------------------------------------------------------ */
-/*  pack_u32_as_f32 — bit-cast uint32 to float                       */
-/* ------------------------------------------------------------------ */
-
-static float sigil__pack_u32_as_f32(uint32_t v) {
-    float f;
-    memcpy(&f, &v, sizeof f);
-    return f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2514,27 +2934,25 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
 
     free(vsSrc); free(fsSrc);
 
-    /* Bind group layout: uniform + curve texture + band texture + gradient texture + sampler */
+    /* Bind group layout: uniform + curve SSBO + band SSBO + gradient texture + sampler */
     WGPUBindGroupLayoutEntry bglEntries[5] = {
         { .binding = 0, .visibility = WGPUShaderStage_Vertex,
           .buffer = {.type = WGPUBufferBindingType_Uniform} },
         { .binding = 1, .visibility = WGPUShaderStage_Fragment,
-          .texture = {.sampleType = WGPUTextureSampleType_UnfilterableFloat,
-                      .viewDimension = WGPUTextureViewDimension_2D} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
         { .binding = 2, .visibility = WGPUShaderStage_Fragment,
-          .texture = {.sampleType = WGPUTextureSampleType_Uint,
-                      .viewDimension = WGPUTextureViewDimension_2D} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
         { .binding = 3, .visibility = WGPUShaderStage_Fragment,
           .texture = {.sampleType = WGPUTextureSampleType_Float,
                       .viewDimension = WGPUTextureViewDimension_2D} },
         { .binding = 4, .visibility = WGPUShaderStage_Fragment,
           .sampler = {.type = WGPUSamplerBindingType_Filtering} },
     };
-    ctx->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(device,
+    ctx->renderBGL = wgpuDeviceCreateBindGroupLayout(device,
         &(WGPUBindGroupLayoutDescriptor){.entryCount = 5, .entries = bglEntries});
-    ctx->pipelineLayout = wgpuDeviceCreatePipelineLayout(device,
+    ctx->renderPipelineLayout = wgpuDeviceCreatePipelineLayout(device,
         &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 1,
-            .bindGroupLayouts = &ctx->bindGroupLayout});
+            .bindGroupLayouts = &ctx->renderBGL});
 
     /* Vertex attributes: 7 x Float32x4, stride = 112 */
     WGPUVertexAttribute vAttrs[7] = {
@@ -2571,7 +2989,7 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
     };
 
     WGPURenderPipelineDescriptor rpDesc = {
-        .layout = ctx->pipelineLayout,
+        .layout = ctx->renderPipelineLayout,
         .vertex = {
             .module = ctx->vertexShader, .entryPoint = STRVIEW("main"),
             .bufferCount = 1, .buffers = &vbLayout
@@ -2596,208 +3014,200 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
 
     ctx->pipeline = wgpuDeviceCreateRenderPipeline(device, &rpDesc);
 
+    /* ---- Gradient sampler (shared by render + gradient compute) ---- */
+    ctx->gradientSampler = wgpuDeviceCreateSampler(device,
+        &(WGPUSamplerDescriptor){
+            .magFilter = WGPUFilterMode_Linear,
+            .minFilter = WGPUFilterMode_Linear,
+            .addressModeU = WGPUAddressMode_ClampToEdge,
+            .addressModeV = WGPUAddressMode_ClampToEdge,
+        });
+
+    /* ---- Prepare compute: bind group layouts ---- */
+    /* group(0): scene data inputs (read-only) */
+    WGPUBindGroupLayoutEntry prepInEntries[5] = {
+        { .binding = 0, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 1, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 2, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 3, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 4, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Uniform} },
+    };
+    ctx->prepareInputBGL = wgpuDeviceCreateBindGroupLayout(device,
+        &(WGPUBindGroupLayoutDescriptor){.entryCount = 5, .entries = prepInEntries});
+
+    /* group(1): output buffers (read-write) */
+    WGPUBindGroupLayoutEntry prepOutEntries[4] = {
+        { .binding = 0, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Storage} },
+        { .binding = 1, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Storage} },
+        { .binding = 2, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Storage} },
+        { .binding = 3, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Storage} },
+    };
+    ctx->prepareOutputBGL = wgpuDeviceCreateBindGroupLayout(device,
+        &(WGPUBindGroupLayoutDescriptor){.entryCount = 4, .entries = prepOutEntries});
+
+    WGPUBindGroupLayout prepareBGLs[2] = { ctx->prepareInputBGL, ctx->prepareOutputBGL };
+    ctx->preparePipelineLayout = wgpuDeviceCreatePipelineLayout(device,
+        &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 2,
+            .bindGroupLayouts = prepareBGLs});
+
+    /* ---- Gradient compute: bind group layout ---- */
+    WGPUBindGroupLayoutEntry gradEntries[3] = {
+        { .binding = 0, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 1, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+        { .binding = 2, .visibility = WGPUShaderStage_Compute,
+          .buffer = {.type = WGPUBufferBindingType_Storage} },
+    };
+    ctx->gradientBGL = wgpuDeviceCreateBindGroupLayout(device,
+        &(WGPUBindGroupLayoutDescriptor){.entryCount = 3, .entries = gradEntries});
+    ctx->gradientPipelineLayout = wgpuDeviceCreatePipelineLayout(device,
+        &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 1,
+            .bindGroupLayouts = &ctx->gradientBGL});
+
+    /* ---- Load compute shaders ---- */
+    char csPreparePath[1024], csGradPath[1024];
+    char *csPrepareSrc = NULL, *csGradSrc = NULL;
+    if (shaderDir && shaderDir[0]) {
+        snprintf(csPreparePath, sizeof csPreparePath, "%s/sigil_prepare_compute.wgsl", shaderDir);
+        snprintf(csGradPath, sizeof csGradPath, "%s/sigil_bake_gradient.wgsl", shaderDir);
+        csPrepareSrc = sigil__read_file(csPreparePath);
+        csGradSrc    = sigil__read_file(csGradPath);
+    }
+    if (!csPrepareSrc || !csGradSrc) {
+        free(csPrepareSrc); free(csGradSrc);
+        snprintf(csPreparePath, sizeof csPreparePath, "sigil_prepare_compute.wgsl");
+        snprintf(csGradPath, sizeof csGradPath, "sigil_bake_gradient.wgsl");
+        csPrepareSrc = sigil__read_file(csPreparePath);
+        csGradSrc    = sigil__read_file(csGradPath);
+    }
+    if (!csPrepareSrc || !csGradSrc) {
+        free(csPrepareSrc); free(csGradSrc);
+        snprintf(csPreparePath, sizeof csPreparePath, "../sigil_prepare_compute.wgsl");
+        snprintf(csGradPath, sizeof csGradPath, "../sigil_bake_gradient.wgsl");
+        csPrepareSrc = sigil__read_file(csPreparePath);
+        csGradSrc    = sigil__read_file(csGradPath);
+    }
+    if (!csPrepareSrc || !csGradSrc) {
+        fprintf(stderr, "sigil_create: compute shader files not found (searched CWD, ../, SIGIL_SHADER_PATH)\n");
+        free(csPrepareSrc); free(csGradSrc);
+        /* Non-fatal for now: leave compute pipelines NULL */
+    } else {
+        WGPUShaderSourceWGSL csPreWgsl = {
+            .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+            .code = {.data = csPrepareSrc, .length = WGPU_STRLEN}
+        };
+        ctx->prepareShader = wgpuDeviceCreateShaderModule(device,
+            &(WGPUShaderModuleDescriptor){.nextInChain = &csPreWgsl.chain});
+
+        WGPUShaderSourceWGSL csGradWgsl = {
+            .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+            .code = {.data = csGradSrc, .length = WGPU_STRLEN}
+        };
+        ctx->gradientShader = wgpuDeviceCreateShaderModule(device,
+            &(WGPUShaderModuleDescriptor){.nextInChain = &csGradWgsl.chain});
+
+        free(csPrepareSrc); free(csGradSrc);
+
+        /* Create compute pipelines */
+        ctx->preparePipeline = wgpuDeviceCreateComputePipeline(device,
+            &(WGPUComputePipelineDescriptor){
+                .layout = ctx->preparePipelineLayout,
+                .compute = {.module = ctx->prepareShader, .entryPoint = STRVIEW("main")}
+            });
+        ctx->gradientPipeline = wgpuDeviceCreateComputePipeline(device,
+            &(WGPUComputePipelineDescriptor){
+                .layout = ctx->gradientPipelineLayout,
+                .compute = {.module = ctx->gradientShader, .entryPoint = STRVIEW("main")}
+            });
+    }
+
     return ctx;
 }
 
 /* ------------------------------------------------------------------ */
-/*  sigil_prepare — band building, texture packing, GPU upload        */
+/*  sigil_upload — flatten scene into GPU storage buffers             */
 /* ------------------------------------------------------------------ */
 
-SigilDrawData* sigil_prepare(SigilContext* ctx, SigilScene* scene,
-                             float viewport_w, float viewport_h,
-                             bool depth_buffering) {
-    (void)depth_buffering;
+SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
     if (!ctx || !scene || scene->element_count == 0) return NULL;
 
-    int ec = scene->element_count;
+    uint32_t ec = (uint32_t)scene->element_count;
     SigilElement *elems = scene->elements;
-
-    /* Sort bands for all elements */
-    for (int ei = 0; ei < ec; ei++) {
-        SigilElement *e = &elems[ei];
-        for (int b = 0; b < SIGIL_BAND_COUNT; b++) {
-            sigil__sort_band(&e->bands.hBands[b], e->curves, 0);
-            sigil__sort_band(&e->bands.vBands[b], e->curves, 1);
-        }
-    }
-
-    /* --- Pack curve texture (RGBA32Float, width=SIGIL_TEX_WIDTH) --- */
-    const int W = SIGIL_TEX_WIDTH;
-
-    int totalCurveTexels = 0;
-    for (int ei = 0; ei < ec; ei++)
-        totalCurveTexels += (int)elems[ei].curve_count * 2;
-
-    int cH = (totalCurveTexels + W - 1) / W;
-    if (cH < 1) cH = 1;
-    float *curveTexData = (float *)calloc((size_t)W * (size_t)cH * 4, sizeof(float));
-
-    /* curveStart[ei] = texel index of first curve texel for element ei */
-    int *curveStart = (int *)malloc((size_t)ec * sizeof(int));
-    int cIdx = 0;
-
-    for (int ei = 0; ei < ec; ei++) {
-        curveStart[ei] = cIdx;
-        for (uint32_t ci = 0; ci < elems[ei].curve_count; ci++) {
-            SigilCurve *c = &elems[ei].curves[ci];
-            /* texel 0: p0.xy, p1.xy */
-            int tx0 = cIdx % W, ty0 = cIdx / W;
-            int off0 = (ty0 * W + tx0) * 4;
-            curveTexData[off0]   = c->p0x; curveTexData[off0+1] = c->p0y;
-            curveTexData[off0+2] = c->p1x; curveTexData[off0+3] = c->p1y;
-            /* texel 1: p2.xy, unused */
-            int tx1 = (cIdx+1) % W, ty1 = (cIdx+1) / W;
-            int off1 = (ty1 * W + tx1) * 4;
-            curveTexData[off1]   = c->p2x; curveTexData[off1+1] = c->p2y;
-            cIdx += 2;
-        }
-    }
-
-    /* --- Pack band texture (RGBA32Uint, width=SIGIL_TEX_WIDTH) --- */
-    int totalBand = 0;
-    for (int ei = 0; ei < ec; ei++) {
-        int hdr = SIGIL_BAND_COUNT + SIGIL_BAND_COUNT; /* h bands + v bands */
-        int pad = W - (totalBand % W);
-        if (pad < hdr && pad < W) totalBand += pad;
-        totalBand += hdr;
-        for (int b = 0; b < SIGIL_BAND_COUNT; b++)
-            totalBand += elems[ei].bands.hBands[b].count;
-        for (int b = 0; b < SIGIL_BAND_COUNT; b++)
-            totalBand += elems[ei].bands.vBands[b].count;
-    }
-
-    int bH = (totalBand + W - 1) / W;
-    if (bH < 1) bH = 1;
-    uint32_t *bandTexData = (uint32_t *)calloc((size_t)W * (size_t)bH * 4, sizeof(uint32_t));
-    int *locX = (int *)malloc((size_t)ec * sizeof(int));
-    int *locY = (int *)malloc((size_t)ec * sizeof(int));
-    int bIdx = 0;
-
-    for (int ei = 0; ei < ec; ei++) {
-        SigilElement *e = &elems[ei];
-        int hbc = SIGIL_BAND_COUNT, vbc = SIGIL_BAND_COUNT;
-        int hdr = hbc + vbc;
-
-        /* avoid header row-wrap */
-        int cx = bIdx % W;
-        if (cx + hdr > W) bIdx = (bIdx / W + 1) * W;
-
-        locX[ei] = bIdx % W;
-        locY[ei] = bIdx / W;
-        int elemStart = bIdx;
-        int gcs = curveStart[ei];
-
-        /* compute offsets for curve lists */
-        int clOff = hdr;
-        int *offs = (int *)malloc((size_t)hdr * sizeof(int));
-        for (int i = 0; i < hbc; i++) {
-            offs[i] = clOff;
-            clOff += e->bands.hBands[i].count;
-        }
-        for (int i = 0; i < vbc; i++) {
-            offs[hbc + i] = clOff;
-            clOff += e->bands.vBands[i].count;
-        }
-
-        /* write headers */
-        for (int i = 0; i < hdr; i++) {
-            int tl = elemStart + i;
-            int di = (tl / W * W + tl % W) * 4;
-            int cnt = i < hbc ? e->bands.hBands[i].count
-                              : e->bands.vBands[i - hbc].count;
-            bandTexData[di]   = (uint32_t)cnt;
-            bandTexData[di+1] = (uint32_t)offs[i];
-        }
-
-        /* write curve lists */
-        for (int i = 0; i < hdr; i++) {
-            SigilBandEntry *band = i < hbc ? &e->bands.hBands[i]
-                                           : &e->bands.vBands[i - hbc];
-            int ls = elemStart + offs[i];
-            for (int j = 0; j < band->count; j++) {
-                int ct = gcs + band->curveIndices[j] * 2;
-                int tl = ls + j;
-                int di = (tl / W * W + tl % W) * 4;
-                bandTexData[di]   = (uint32_t)(ct % W);
-                bandTexData[di+1] = (uint32_t)(ct / W);
-            }
-        }
-
-        free(offs);
-        bIdx = elemStart + clOff;
-    }
-
-    /* --- Build vertex/index buffers --- */
-    /* viewBox -> viewport mapping */
-    float vbX = 0, vbY = 0, vbW = viewport_w, vbH = viewport_h;
-    if (scene->has_viewBox) {
-        vbX = scene->viewBox[0];
-        vbY = scene->viewBox[1];
-        vbW = scene->viewBox[2];
-        vbH = scene->viewBox[3];
-    }
-    float scale = fminf(viewport_w / vbW, viewport_h / vbH);
-    float invScale = 1.0f / scale;
-
-    /* --- Bake gradient ramp textures (RGBA8Unorm for filterable sampling) --- */
     int gradCount = scene->gradient_count;
     int gradTexH = gradCount > 0 ? gradCount : 1;
-    uint8_t *gradTexData = (uint8_t *)calloc((size_t)SIGIL_GRADIENT_RAMP_WIDTH * (size_t)gradTexH * 4, 1);
-    for (int gi = 0; gi < gradCount; gi++) {
-        sigil__bake_gradient_ramp(&scene->gradients[gi],
-            gradTexData + gi * SIGIL_GRADIENT_RAMP_WIDTH * 4);
+
+    /* ---- Count total curves ---- */
+    uint32_t totalCurves = 0;
+    for (uint32_t ei = 0; ei < ec; ei++)
+        totalCurves += elems[ei].curve_count;
+
+    /* ---- Flatten curves buffer: 6 floats per curve ---- */
+    size_t curvesBytes = (size_t)totalCurves * 6 * sizeof(float);
+    if (curvesBytes < 4) curvesBytes = 4;
+    float *curvesData = (float *)malloc(curvesBytes);
+    uint32_t ci = 0;
+    for (uint32_t ei = 0; ei < ec; ei++) {
+        for (uint32_t k = 0; k < elems[ei].curve_count; k++) {
+            SigilCurve *c = &elems[ei].curves[k];
+            curvesData[ci * 6 + 0] = c->p0x;
+            curvesData[ci * 6 + 1] = c->p0y;
+            curvesData[ci * 6 + 2] = c->p1x;
+            curvesData[ci * 6 + 3] = c->p1y;
+            curvesData[ci * 6 + 4] = c->p2x;
+            curvesData[ci * 6 + 5] = c->p2y;
+            ci++;
+        }
     }
 
-    /* 28 floats per vertex (7 x float4), stride = 112 */
-    float *verts = (float *)malloc((size_t)ec * 4 * 28 * sizeof(float));
-    uint32_t *idxs = (uint32_t *)malloc((size_t)ec * 6 * sizeof(uint32_t));
-    int vc = 0, ic = 0, qi = 0;
-
-    for (int ei = 0; ei < ec; ei++) {
+    /* ---- Elements buffer: 22 u32/f32 per element (88 bytes) ---- */
+    size_t elemBytes = (size_t)ec * 22 * sizeof(uint32_t);
+    if (elemBytes < 4) elemBytes = 4;
+    uint32_t *elemData = (uint32_t *)calloc(ec, 22 * sizeof(uint32_t));
+    uint32_t curveOff = 0;
+    for (uint32_t ei = 0; ei < ec; ei++) {
         SigilElement *e = &elems[ei];
-        if (e->curve_count == 0) continue;
+        uint32_t *row = &elemData[ei * 22];
+
+        row[0] = curveOff;               /* curve_offset */
+        row[1] = e->curve_count;         /* curve_count */
 
         float xMin = e->bounds.xMin, yMin = e->bounds.yMin;
         float xMax = e->bounds.xMax, yMax = e->bounds.yMax;
         float ew = xMax - xMin, eh = yMax - yMin;
 
-        /* Convert from viewBox coords to pixel coords */
-        float px0 = (xMin - vbX) * scale;
-        float py0 = (yMin - vbY) * scale;
-        float px1 = (xMax - vbX) * scale;
-        float py1 = (yMax - vbY) * scale;
+        memcpy(&row[2], &xMin, 4);       /* bounds_xMin */
+        memcpy(&row[3], &yMin, 4);       /* bounds_yMin */
+        memcpy(&row[4], &xMax, 4);       /* bounds_xMax */
+        memcpy(&row[5], &yMax, 4);       /* bounds_yMax */
 
-        /* band scale/offset in em-space (viewBox coords) */
-        float bsX = ew > 0 ? (float)SIGIL_BAND_COUNT / ew : 0;
-        float bsY = eh > 0 ? (float)SIGIL_BAND_COUNT / eh : 0;
-        float boX = -xMin * bsX;
-        float boY = -yMin * bsY;
+        /* fill color: RGBA 0-1, NOT premultiplied */
+        memcpy(&row[6],  &e->fill_color[0], 4);
+        memcpy(&row[7],  &e->fill_color[1], 4);
+        memcpy(&row[8],  &e->fill_color[2], 4);
+        memcpy(&row[9],  &e->fill_color[3], 4);
 
-        /* Pack glyph location and band maxes */
-        float glp = sigil__pack_u32_as_f32(
-            ((uint32_t)locY[ei] << 16) | (uint32_t)locX[ei]);
+        row[10] = (uint32_t)e->fill_rule; /* fill_rule */
+        int32_t gi = (int32_t)e->fill_gradient_idx;
+        memcpy(&row[11], &gi, 4);         /* gradient_idx (i32) */
+        memcpy(&row[12], &e->opacity, 4); /* opacity */
+        row[13] = 0;                       /* pad */
 
-        uint32_t bandMaxPacked = ((uint32_t)(SIGIL_BAND_COUNT - 1) << 16)
-                               | (uint32_t)(SIGIL_BAND_COUNT - 1);
-        /* Set even-odd flag at bit 28 if needed */
-        if (e->fill_rule == SIGIL_FILL_EVENODD)
-            bandMaxPacked |= (1u << 28);
-        float bmp = sigil__pack_u32_as_f32(bandMaxPacked);
-
-        /* Color: premultiplied alpha */
-        float alpha = e->fill_color[3] * e->opacity;
-        float cr = e->fill_color[0] * alpha;
-        float cg = e->fill_color[1] * alpha;
-        float cb = e->fill_color[2] * alpha;
-
-        /* Gradient params (attrs 5+6): default to zeros (solid fill) */
+        /* Gradient params: pre-compute grad0, grad1 */
         float grad0[4] = {0, 0, 0, 0};
         float grad1[4] = {0, 0, 0, 0};
-        int isGradient = 0;
 
         if (e->fill_gradient_idx >= 0 && e->fill_gradient_idx < gradCount) {
             const SigilGradientDef *gd = &scene->gradients[e->fill_gradient_idx];
-            isGradient = 1;
             /* grad1.x = normalized Y in gradient texture (center of row) */
             grad1[0] = ((float)e->fill_gradient_idx + 0.5f) / (float)gradTexH;
             grad1[1] = (float)gd->type; /* 1=linear, 2=radial */
@@ -2838,147 +3248,202 @@ SigilDrawData* sigil_prepare(SigilContext* ctx, SigilScene* scene,
                 grad0[0] = tcx; grad0[1] = tcy; grad0[2] = tfx; grad0[3] = tfy;
                 grad1[2] = gr * tscale; /* transformed outer radius */
             }
-
-            /* For gradient elements: set color to white with element opacity
-               (gradient color comes from texture sampling in fragment shader) */
-            cr = 0; cg = 0; cb = 0; alpha = -e->opacity; /* negative alpha = gradient signal */
         }
 
-        /* 4 corners: pixel-space position, normal direction, em-space coords */
-        float corners[4][6] = {
-            {px0, py0, -1, -1, xMin, yMin},
-            {px1, py0,  1, -1, xMax, yMin},
-            {px1, py1,  1,  1, xMax, yMax},
-            {px0, py1, -1,  1, xMin, yMax},
-        };
+        memcpy(&row[14], grad0, 16);  /* grad0: 4 floats */
+        memcpy(&row[18], grad1, 16);  /* grad1: 4 floats */
 
-        for (int c = 0; c < 4; c++) {
-            float *v = &verts[vc * 28];
-            /* attr 0: position.xy, normal.xy */
-            v[ 0] = corners[c][0]; v[ 1] = corners[c][1];
-            v[ 2] = corners[c][2]; v[ 3] = corners[c][3];
-            /* attr 1: glyphCoord.xy, glyphLoc, bandMaxes */
-            v[ 4] = corners[c][4]; v[ 5] = corners[c][5];
-            v[ 6] = glp;           v[ 7] = bmp;
-            /* attr 2: jacobian (invScale, 0, 0, invScale) */
-            v[ 8] = invScale;      v[ 9] = 0;
-            v[10] = 0;             v[11] = invScale;
-            /* attr 3: bandScale.xy, bandOffset.xy */
-            v[12] = bsX;           v[13] = bsY;
-            v[14] = boX;           v[15] = boY;
-            /* attr 4: color.rgba (premultiplied; negative alpha = gradient) */
-            v[16] = cr;            v[17] = cg;
-            v[18] = cb;            v[19] = alpha;
-            /* attr 5: grad0 (linear: x1,y1,x2,y2; radial: cx,cy,fx,fy) */
-            v[20] = grad0[0];     v[21] = grad0[1];
-            v[22] = grad0[2];     v[23] = grad0[3];
-            /* attr 6: grad1 (gradTexRow, gradType, radius, spread) */
-            v[24] = grad1[0];     v[25] = grad1[1];
-            v[26] = grad1[2];     v[27] = grad1[3];
-            vc++;
+        curveOff += e->curve_count;
+    }
+
+    /* ---- Offsets buffer: per-element {curve_start, band_start} ---- */
+    uint32_t *offsetData = (uint32_t *)malloc((size_t)ec * 2 * sizeof(uint32_t));
+    uint32_t curveStart = 0, bandStart = 0;
+    for (uint32_t ei = 0; ei < ec; ei++) {
+        offsetData[ei * 2 + 0] = curveStart;
+        offsetData[ei * 2 + 1] = bandStart;
+        curveStart += elems[ei].curve_count * 2; /* 2 vec4s per curve */
+        bandStart  += 16 + elems[ei].curve_count * 16; /* worst-case band alloc */
+    }
+    /* curveStart and bandStart are now the final totals (output buffer sizes) */
+    uint32_t curveOutVec4s = curveStart;
+    uint32_t bandOutVec4s  = bandStart;
+    size_t offsetsBytes = (size_t)ec * 2 * sizeof(uint32_t);
+    if (offsetsBytes < 4) offsetsBytes = 4;
+
+    /* ---- Gradient buffers ---- */
+    uint32_t *gradBufData = NULL;
+    float *stopBufData = NULL;
+    size_t gradBufBytes = 4; /* minimum non-zero */
+    size_t stopBufBytes = 4;
+    uint32_t totalStops = 0;
+
+    if (gradCount > 0) {
+        /* 24 u32/f32 per gradient (96 bytes) */
+        gradBufBytes = (size_t)gradCount * 24 * sizeof(uint32_t);
+        gradBufData = (uint32_t *)calloc((size_t)gradCount, 24 * sizeof(uint32_t));
+
+        /* Count total stops for sizing */
+        for (int gi = 0; gi < gradCount; gi++)
+            totalStops += (uint32_t)scene->gradients[gi].stop_count;
+
+        /* 8 floats per stop (32 bytes) */
+        stopBufBytes = totalStops > 0 ? (size_t)totalStops * 8 * sizeof(float) : 4;
+        stopBufData = (float *)calloc(totalStops > 0 ? totalStops : 1, 8 * sizeof(float));
+
+        uint32_t stopOffset = 0;
+        for (int gi = 0; gi < gradCount; gi++) {
+            const SigilGradientDef *gd = &scene->gradients[gi];
+            uint32_t *gRow = &gradBufData[gi * 24];
+
+            /* First 8 words: i32 fields */
+            int32_t typeVal = (int32_t)gd->type;
+            int32_t spreadVal = (int32_t)gd->spread;
+            int32_t scVal = (int32_t)gd->stop_count;
+            int32_t soVal = (int32_t)stopOffset;
+            int32_t oBBox = (int32_t)gd->objectBBox;
+            memcpy(&gRow[0], &typeVal, 4);
+            memcpy(&gRow[1], &spreadVal, 4);
+            memcpy(&gRow[2], &scVal, 4);
+            memcpy(&gRow[3], &soVal, 4);
+            memcpy(&gRow[4], &oBBox, 4);
+            gRow[5] = 0; gRow[6] = 0; gRow[7] = 0; /* pads */
+
+            /* Next 16 words: float fields */
+            float *gf = (float *)&gRow[8];
+            gf[0]  = gd->x1;  gf[1]  = gd->y1;  gf[2]  = gd->x2;  gf[3]  = gd->y2;
+            gf[4]  = gd->cx;  gf[5]  = gd->cy;  gf[6]  = gd->r;
+            gf[7]  = gd->fx;  gf[8]  = gd->fy;  gf[9]  = gd->fr;
+            gf[10] = gd->transform[0]; gf[11] = gd->transform[1];
+            gf[12] = gd->transform[2]; gf[13] = gd->transform[3];
+            gf[14] = gd->transform[4]; gf[15] = gd->transform[5];
+
+            /* Fill stops */
+            for (int si = 0; si < gd->stop_count; si++) {
+                float *sRow = &stopBufData[(stopOffset + (uint32_t)si) * 8];
+                sRow[0] = gd->stops[si].color[0];
+                sRow[1] = gd->stops[si].color[1];
+                sRow[2] = gd->stops[si].color[2];
+                sRow[3] = gd->stops[si].color[3];
+                sRow[4] = gd->stops[si].offset;
+                sRow[5] = 0; sRow[6] = 0; sRow[7] = 0; /* pad */
+            }
+            stopOffset += (uint32_t)gd->stop_count;
         }
-
-        uint32_t base = (uint32_t)(qi * 4);
-        idxs[ic++] = base;     idxs[ic++] = base + 1; idxs[ic++] = base + 2;
-        idxs[ic++] = base;     idxs[ic++] = base + 2; idxs[ic++] = base + 3;
-        qi++;
     }
 
-    free(curveStart);
+    /* ---- Allocate SigilGPUScene ---- */
+    SigilGPUScene *gs = (SigilGPUScene *)calloc(1, sizeof(SigilGPUScene));
+    gs->elementCount = ec;
+    gs->totalCurves = totalCurves;
+    gs->gradientCount = (uint32_t)gradCount;
+    gs->hasViewBox = scene->has_viewBox;
+    memcpy(gs->viewBox, scene->viewBox, sizeof(float) * 4);
 
-    if (vc == 0 || ic == 0) {
-        free(verts); free(idxs); free(locX); free(locY);
-        free(curveTexData); free(bandTexData); free(gradTexData);
-        return NULL;
-    }
-
-    /* --- Upload to GPU --- */
-    SigilDrawData *dd = (SigilDrawData *)calloc(1, sizeof(SigilDrawData));
-    dd->indexCount = ic;
-
+    WGPUDevice device = ctx->device;
     WGPUQueue queue = ctx->queue;
 
-    /* Vertex buffer */
-    dd->vertexBuffer = wgpuDeviceCreateBuffer(ctx->device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst,
-            .size = (uint64_t)vc * 112
-        });
-    wgpuQueueWriteBuffer(queue, dd->vertexBuffer, 0, verts, (size_t)vc * 112);
+    /* ---- Create and upload input buffers ---- */
 
-    /* Index buffer */
-    dd->indexBuffer = wgpuDeviceCreateBuffer(ctx->device,
+    /* Curves buffer */
+    gs->curvesBuf = wgpuDeviceCreateBuffer(device,
         &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst,
-            .size = (uint64_t)ic * 4
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = curvesBytes
         });
-    wgpuQueueWriteBuffer(queue, dd->indexBuffer, 0, idxs, (size_t)ic * 4);
+    wgpuQueueWriteBuffer(queue, gs->curvesBuf, 0, curvesData, curvesBytes);
 
-    /* Uniform buffer (80 bytes = 20 floats) */
-    dd->uniformBuffer = wgpuDeviceCreateBuffer(ctx->device,
+    /* Elements buffer */
+    gs->elementsBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = elemBytes
+        });
+    wgpuQueueWriteBuffer(queue, gs->elementsBuf, 0, elemData, elemBytes);
+
+    /* Offsets buffer */
+    gs->offsetsBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = offsetsBytes
+        });
+    wgpuQueueWriteBuffer(queue, gs->offsetsBuf, 0, offsetData, offsetsBytes);
+
+    /* Gradients buffer */
+    gs->gradientsBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = gradBufBytes
+        });
+    if (gradBufData) {
+        wgpuQueueWriteBuffer(queue, gs->gradientsBuf, 0, gradBufData, gradBufBytes);
+    }
+
+    /* Gradient stops buffer */
+    gs->gradientStopsBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = stopBufBytes
+        });
+    if (stopBufData) {
+        wgpuQueueWriteBuffer(queue, gs->gradientStopsBuf, 0, stopBufData, stopBufBytes);
+    }
+
+    /* Viewport uniform buffer (32 bytes = 8 floats, written per-prepare) */
+    gs->viewportBuf = wgpuDeviceCreateBuffer(device,
         &(WGPUBufferDescriptor){
             .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-            .size = 80
+            .size = 32
         });
 
-    /* MVP matrix: pixel coords → clip space. SVG Y-down → WebGPU Y-up. */
-    float ubo[20] = {
-         2.0f / viewport_w, 0, 0, -1.0f,
-         0, -2.0f / viewport_h, 0,  1.0f,  /* negate Y for SVG Y-down */
-         0, 0, 0, 0,
-         0, 0, 0, 1,
-         viewport_w, viewport_h, 0, 0,
-    };
-    wgpuQueueWriteBuffer(queue, dd->uniformBuffer, 0, ubo, sizeof ubo);
+    /* ---- Create output buffers ---- */
+    /* All output buffers get CopyDst for CPU fallback path */
 
-    /* Curve texture (RGBA32Float) */
-    dd->curveTexture = wgpuDeviceCreateTexture(ctx->device,
-        &(WGPUTextureDescriptor){
-            .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-            .size = {(uint32_t)W, (uint32_t)cH, 1},
-            .format = WGPUTextureFormat_RGBA32Float,
-            .mipLevelCount = 1, .sampleCount = 1,
-            .dimension = WGPUTextureDimension_2D,
-        });
-    wgpuQueueWriteTexture(queue,
-        &(WGPUTexelCopyTextureInfo){.texture = dd->curveTexture, .aspect = WGPUTextureAspect_All},
-        curveTexData, (size_t)W * (size_t)cH * 16,
-        &(WGPUTexelCopyBufferLayout){.bytesPerRow = (uint32_t)(W * 16), .rowsPerImage = (uint32_t)cH},
-        &(WGPUExtent3D){(uint32_t)W, (uint32_t)cH, 1});
-    dd->curveView = wgpuTextureCreateView(dd->curveTexture,
-        &(WGPUTextureViewDescriptor){
-            .format = WGPUTextureFormat_RGBA32Float,
-            .dimension = WGPUTextureViewDimension_2D,
-            .mipLevelCount = 1, .arrayLayerCount = 1,
-            .aspect = WGPUTextureAspect_All,
-            .usage = WGPUTextureUsage_TextureBinding
+    /* curveBuf: curveOutVec4s * 16 bytes */
+    uint64_t curveBufSize = curveOutVec4s > 0 ? (uint64_t)curveOutVec4s * 16 : 4;
+    gs->curveBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = curveBufSize
         });
 
-    /* Band texture (RGBA32Uint) */
-    dd->bandTexture = wgpuDeviceCreateTexture(ctx->device,
-        &(WGPUTextureDescriptor){
-            .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-            .size = {(uint32_t)W, (uint32_t)bH, 1},
-            .format = WGPUTextureFormat_RGBA32Uint,
-            .mipLevelCount = 1, .sampleCount = 1,
-            .dimension = WGPUTextureDimension_2D,
-        });
-    wgpuQueueWriteTexture(queue,
-        &(WGPUTexelCopyTextureInfo){.texture = dd->bandTexture, .aspect = WGPUTextureAspect_All},
-        bandTexData, (size_t)W * (size_t)bH * 16,
-        &(WGPUTexelCopyBufferLayout){.bytesPerRow = (uint32_t)(W * 16), .rowsPerImage = (uint32_t)bH},
-        &(WGPUExtent3D){(uint32_t)W, (uint32_t)bH, 1});
-    dd->bandView = wgpuTextureCreateView(dd->bandTexture,
-        &(WGPUTextureViewDescriptor){
-            .format = WGPUTextureFormat_RGBA32Uint,
-            .dimension = WGPUTextureViewDimension_2D,
-            .mipLevelCount = 1, .arrayLayerCount = 1,
-            .aspect = WGPUTextureAspect_All,
-            .usage = WGPUTextureUsage_TextureBinding
+    /* bandBuf: bandOutVec4s * 16 bytes */
+    uint64_t bandBufSize = bandOutVec4s > 0 ? (uint64_t)bandOutVec4s * 16 : 4;
+    gs->bandBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+            .size = bandBufSize
         });
 
-    /* Gradient ramp texture (RGBA8Unorm — filterable for linear sampling) */
-    dd->gradientTexture = wgpuDeviceCreateTexture(ctx->device,
+    /* vertexBuf: ec * 4 * 112 bytes (Vertex + CopyDst) */
+    uint64_t vertexBufSize = (uint64_t)ec * 4 * 112;
+    if (vertexBufSize < 4) vertexBufSize = 4;
+    gs->vertexBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+            .size = vertexBufSize
+        });
+
+    /* indexBuf: ec * 6 * 4 bytes (Index + CopyDst) */
+    uint64_t indexBufSize = (uint64_t)ec * 6 * 4;
+    if (indexBufSize < 4) indexBufSize = 4;
+    gs->indexBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst,
+            .size = indexBufSize
+        });
+
+    /* gradientRampBuf: gradTexH * 256 * 4 bytes (Storage + CopySrc) */
+    uint64_t rampBufSize = (uint64_t)gradTexH * 256 * 4;
+    if (rampBufSize < 4) rampBufSize = 4;
+    gs->gradientRampBuf = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
+            .size = rampBufSize
+        });
+
+    /* ---- Gradient ramp texture: RGBA8Unorm, 256 x gradTexH ---- */
+    gs->gradientTexture = wgpuDeviceCreateTexture(device,
         &(WGPUTextureDescriptor){
             .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
             .size = {(uint32_t)SIGIL_GRADIENT_RAMP_WIDTH, (uint32_t)gradTexH, 1},
@@ -2986,13 +3451,7 @@ SigilDrawData* sigil_prepare(SigilContext* ctx, SigilScene* scene,
             .mipLevelCount = 1, .sampleCount = 1,
             .dimension = WGPUTextureDimension_2D,
         });
-    wgpuQueueWriteTexture(queue,
-        &(WGPUTexelCopyTextureInfo){.texture = dd->gradientTexture, .aspect = WGPUTextureAspect_All},
-        gradTexData, (size_t)SIGIL_GRADIENT_RAMP_WIDTH * (size_t)gradTexH * 4,
-        &(WGPUTexelCopyBufferLayout){.bytesPerRow = (uint32_t)(SIGIL_GRADIENT_RAMP_WIDTH * 4),
-            .rowsPerImage = (uint32_t)gradTexH},
-        &(WGPUExtent3D){(uint32_t)SIGIL_GRADIENT_RAMP_WIDTH, (uint32_t)gradTexH, 1});
-    dd->gradientView = wgpuTextureCreateView(dd->gradientTexture,
+    gs->gradientView = wgpuTextureCreateView(gs->gradientTexture,
         &(WGPUTextureViewDescriptor){
             .format = WGPUTextureFormat_RGBA8Unorm,
             .dimension = WGPUTextureViewDimension_2D,
@@ -3000,34 +3459,419 @@ SigilDrawData* sigil_prepare(SigilContext* ctx, SigilScene* scene,
             .aspect = WGPUTextureAspect_All,
             .usage = WGPUTextureUsage_TextureBinding
         });
-    dd->gradientSampler = wgpuDeviceCreateSampler(ctx->device,
-        &(WGPUSamplerDescriptor){
-            .magFilter = WGPUFilterMode_Linear,
-            .minFilter = WGPUFilterMode_Linear,
-            .addressModeU = WGPUAddressMode_ClampToEdge,
-            .addressModeV = WGPUAddressMode_ClampToEdge,
-        });
 
-    /* Bind group */
-    WGPUBindGroupEntry bgEntries[5] = {
-        {.binding = 0, .buffer = dd->uniformBuffer, .size = 80},
-        {.binding = 1, .textureView = dd->curveView},
-        {.binding = 2, .textureView = dd->bandView},
-        {.binding = 3, .textureView = dd->gradientView},
-        {.binding = 4, .sampler = dd->gradientSampler},
+    /* ---- Build compute bind groups ---- */
+
+    /* prepareInputBG: group(0) — 5 bindings */
+    WGPUBindGroupEntry inputEntries[5] = {
+        {.binding = 0, .buffer = gs->curvesBuf,    .size = curvesBytes},
+        {.binding = 1, .buffer = gs->elementsBuf,  .size = elemBytes},
+        {.binding = 2, .buffer = gs->offsetsBuf,   .size = offsetsBytes},
+        {.binding = 3, .buffer = gs->gradientsBuf, .size = gradBufBytes},
+        {.binding = 4, .buffer = gs->viewportBuf,  .size = 32},
     };
-    dd->bindGroup = wgpuDeviceCreateBindGroup(ctx->device,
+    gs->prepareInputBG = wgpuDeviceCreateBindGroup(device,
         &(WGPUBindGroupDescriptor){
-            .layout = ctx->bindGroupLayout,
-            .entryCount = 5, .entries = bgEntries
+            .layout = ctx->prepareInputBGL,
+            .entryCount = 5, .entries = inputEntries
         });
 
-    /* Free CPU-side data */
-    free(verts); free(idxs); free(locX); free(locY);
-    free(curveTexData); free(bandTexData); free(gradTexData);
+    /* prepareOutputBG: group(1) — 4 bindings */
+    WGPUBindGroupEntry outputEntries[4] = {
+        {.binding = 0, .buffer = gs->curveBuf,  .size = curveBufSize},
+        {.binding = 1, .buffer = gs->bandBuf,   .size = bandBufSize},
+        {.binding = 2, .buffer = gs->vertexBuf, .size = vertexBufSize},
+        {.binding = 3, .buffer = gs->indexBuf,  .size = indexBufSize},
+    };
+    gs->prepareOutputBG = wgpuDeviceCreateBindGroup(device,
+        &(WGPUBindGroupDescriptor){
+            .layout = ctx->prepareOutputBGL,
+            .entryCount = 4, .entries = outputEntries
+        });
+
+    /* gradientBG: group(0) of gradient compute — 3 bindings (NULL if no grads) */
+    if (gradCount > 0) {
+        WGPUBindGroupEntry gradEntries[3] = {
+            {.binding = 0, .buffer = gs->gradientsBuf,    .size = gradBufBytes},
+            {.binding = 1, .buffer = gs->gradientStopsBuf, .size = stopBufBytes},
+            {.binding = 2, .buffer = gs->gradientRampBuf,  .size = rampBufSize},
+        };
+        gs->gradientBG = wgpuDeviceCreateBindGroup(device,
+            &(WGPUBindGroupDescriptor){
+                .layout = ctx->gradientBGL,
+                .entryCount = 3, .entries = gradEntries
+            });
+    }
+
+    /* ---- Store CPU copies for CPU prepare fallback ---- */
+    gs->cpuElemData   = elemData;     /* 22 u32 per element */
+    gs->cpuOffsetData = offsetData;   /* 2 u32 per element */
+    gs->cpuCurvesData = curvesData;   /* 6 floats per curve */
+    gs->curveOutVec4s = curveOutVec4s;
+    gs->bandOutVec4s  = bandOutVec4s;
+
+    /* ---- Free gradient staging only (elem/curve/offset kept) ---- */
+    free(gradBufData);
+    free(stopBufData);
+
+    return gs;
+}
+
+/* ------------------------------------------------------------------ */
+/*  sigil_free_gpu_scene — release all GPU resources                  */
+/* ------------------------------------------------------------------ */
+
+void sigil_free_gpu_scene(SigilGPUScene* gs) {
+    if (!gs) return;
+
+    /* Bind groups */
+    if (gs->prepareInputBG)  wgpuBindGroupRelease(gs->prepareInputBG);
+    if (gs->prepareOutputBG) wgpuBindGroupRelease(gs->prepareOutputBG);
+    if (gs->gradientBG)      wgpuBindGroupRelease(gs->gradientBG);
+
+    /* Texture view + texture */
+    if (gs->gradientView)    wgpuTextureViewRelease(gs->gradientView);
+    if (gs->gradientTexture) wgpuTextureDestroy(gs->gradientTexture);
+    if (gs->gradientTexture) wgpuTextureRelease(gs->gradientTexture);
+
+    /* Input buffers */
+    if (gs->curvesBuf)       { wgpuBufferDestroy(gs->curvesBuf);       wgpuBufferRelease(gs->curvesBuf); }
+    if (gs->elementsBuf)     { wgpuBufferDestroy(gs->elementsBuf);     wgpuBufferRelease(gs->elementsBuf); }
+    if (gs->offsetsBuf)      { wgpuBufferDestroy(gs->offsetsBuf);      wgpuBufferRelease(gs->offsetsBuf); }
+    if (gs->gradientsBuf)    { wgpuBufferDestroy(gs->gradientsBuf);    wgpuBufferRelease(gs->gradientsBuf); }
+    if (gs->gradientStopsBuf){ wgpuBufferDestroy(gs->gradientStopsBuf);wgpuBufferRelease(gs->gradientStopsBuf); }
+    if (gs->viewportBuf)     { wgpuBufferDestroy(gs->viewportBuf);     wgpuBufferRelease(gs->viewportBuf); }
+
+    /* Output buffers */
+    if (gs->curveBuf)        { wgpuBufferDestroy(gs->curveBuf);        wgpuBufferRelease(gs->curveBuf); }
+    if (gs->bandBuf)         { wgpuBufferDestroy(gs->bandBuf);         wgpuBufferRelease(gs->bandBuf); }
+    if (gs->vertexBuf)       { wgpuBufferDestroy(gs->vertexBuf);       wgpuBufferRelease(gs->vertexBuf); }
+    if (gs->indexBuf)        { wgpuBufferDestroy(gs->indexBuf);        wgpuBufferRelease(gs->indexBuf); }
+    if (gs->gradientRampBuf) { wgpuBufferDestroy(gs->gradientRampBuf); wgpuBufferRelease(gs->gradientRampBuf); }
+
+    /* CPU-side copies */
+    free(gs->cpuElemData);
+    free(gs->cpuOffsetData);
+    free(gs->cpuCurvesData);
+
+    free(gs);
+}
+
+/* ------------------------------------------------------------------ */
+/*  sigil_prepare_gpu — compute dispatch + draw-data creation          */
+/* ------------------------------------------------------------------ */
+
+SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
+                                 WGPUCommandEncoder encoder,
+                                 float viewport_w, float viewport_h) {
+    if (!ctx || !gs || !encoder) return NULL;
+    WGPUQueue queue = ctx->queue;
+
+    /* ---- 1. Viewport computation ---- */
+    float vbX, vbY, vbW, vbH;
+    if (gs->hasViewBox) {
+        vbX = gs->viewBox[0];
+        vbY = gs->viewBox[1];
+        vbW = gs->viewBox[2];
+        vbH = gs->viewBox[3];
+    } else {
+        vbX = 0.0f;
+        vbY = 0.0f;
+        vbW = viewport_w;
+        vbH = viewport_h;
+    }
+    float scale    = (vbW > 0 && vbH > 0)
+                   ? (viewport_w / vbW < viewport_h / vbH ? viewport_w / vbW : viewport_h / vbH)
+                   : 1.0f;
+    float invScale = (scale > 0.0f) ? 1.0f / scale : 1.0f;
+
+    uint32_t ec = gs->elementCount;
+    uint32_t *elemData   = gs->cpuElemData;
+    uint32_t *offsetData = gs->cpuOffsetData;
+    float    *curvesData = gs->cpuCurvesData;
+
+    /* ---- 2. CPU prepare: generate curveBuf, bandBuf, vertexBuf, indexBuf ---- */
+
+    /* 2a. Pack curves into curveBuf (2 vec4s per curve = 8 floats) */
+    uint32_t curveOutVec4s = gs->curveOutVec4s;
+    size_t curveBufFloats = (size_t)curveOutVec4s * 4;
+    float *cpuCurveBuf = (float *)calloc(curveBufFloats > 0 ? curveBufFloats : 1, sizeof(float));
+
+    for (uint32_t ei = 0; ei < ec; ei++) {
+        uint32_t *row = &elemData[ei * 22];
+        uint32_t curveOff   = row[0]; /* curve_offset into curvesData */
+        uint32_t nc         = row[1]; /* curve_count */
+        uint32_t curveStart = offsetData[ei * 2 + 0]; /* output offset in vec4s */
+
+        for (uint32_t ci = 0; ci < nc; ci++) {
+            float *c = &curvesData[(curveOff + ci) * 6];
+            uint32_t base = (curveStart + ci * 2) * 4;
+            cpuCurveBuf[base + 0] = c[0]; /* p0x */
+            cpuCurveBuf[base + 1] = c[1]; /* p0y */
+            cpuCurveBuf[base + 2] = c[2]; /* p1x */
+            cpuCurveBuf[base + 3] = c[3]; /* p1y */
+            cpuCurveBuf[base + 4] = c[4]; /* p2x */
+            cpuCurveBuf[base + 5] = c[5]; /* p2y */
+            cpuCurveBuf[base + 6] = 0.0f;
+            cpuCurveBuf[base + 7] = 0.0f;
+        }
+    }
+
+    /* 2b. Build bands in bandBuf */
+    #define SIGIL_BAND_CNT 8
+    uint32_t bandOutVec4s = gs->bandOutVec4s;
+    size_t bandBufU32s = (size_t)bandOutVec4s * 4;
+    uint32_t *cpuBandBuf = (uint32_t *)calloc(bandBufU32s > 0 ? bandBufU32s : 1, sizeof(uint32_t));
+
+    for (uint32_t ei = 0; ei < ec; ei++) {
+        uint32_t *row = &elemData[ei * 22];
+        uint32_t nc = row[1];
+        uint32_t curveOff = row[0];
+
+        float xMin, yMin, xMax, yMax;
+        memcpy(&xMin, &row[2], 4); memcpy(&yMin, &row[3], 4);
+        memcpy(&xMax, &row[4], 4); memcpy(&yMax, &row[5], 4);
+        float ew = xMax - xMin, eh = yMax - yMin;
+        float bsX = ew > 0 ? 8.0f / ew : 0.0f;
+        float bsY = eh > 0 ? 8.0f / eh : 0.0f;
+        float boX = -xMin * bsX, boY = -yMin * bsY;
+
+        uint32_t bandStart = offsetData[ei * 2 + 1];
+        uint32_t curveStart = offsetData[ei * 2 + 0];
+        uint32_t bandDataBase = bandStart + 16; /* past 16 headers */
+
+        /* Band counters */
+        uint32_t hCnt[SIGIL_BAND_CNT] = {0};
+        uint32_t vCnt[SIGIL_BAND_CNT] = {0};
+
+        for (uint32_t ci = 0; ci < nc; ci++) {
+            float *c = &curvesData[(curveOff + ci) * 6];
+            float cxMin = fminf(fminf(c[0], c[2]), c[4]);
+            float cxMax = fmaxf(fmaxf(c[0], c[2]), c[4]);
+            float cyMin = fminf(fminf(c[1], c[3]), c[5]);
+            float cyMax = fmaxf(fmaxf(c[1], c[3]), c[5]);
+
+            uint32_t curveRef = curveStart + ci * 2;
+
+            /* Horizontal bands (partition by Y) */
+            if (eh > 0) {
+                int b0 = (int)fmaxf(0, fminf(7, floorf(cyMin * bsY + boY)));
+                int b1 = (int)fmaxf(0, fminf(7, floorf(cyMax * bsY + boY)));
+                for (int b = b0; b <= b1; b++) {
+                    uint32_t slot = (bandDataBase + (uint32_t)b * nc + hCnt[b]) * 4;
+                    cpuBandBuf[slot] = curveRef;
+                    hCnt[b]++;
+                }
+            }
+
+            /* Vertical bands (partition by X) */
+            if (ew > 0) {
+                int b0 = (int)fmaxf(0, fminf(7, floorf(cxMin * bsX + boX)));
+                int b1 = (int)fmaxf(0, fminf(7, floorf(cxMax * bsX + boX)));
+                for (int b = b0; b <= b1; b++) {
+                    uint32_t slot = (bandDataBase + (SIGIL_BAND_CNT + (uint32_t)b) * nc + vCnt[b]) * 4;
+                    cpuBandBuf[slot] = curveRef;
+                    vCnt[b]++;
+                }
+            }
+        }
+
+        /* Sort bands: insertion sort descending by max coordinate */
+        for (int b = 0; b < SIGIL_BAND_CNT; b++) {
+            uint32_t cnt = hCnt[b];
+            uint32_t base = (bandDataBase + (uint32_t)b * nc) * 4;
+            for (uint32_t i = 1; i < cnt; i++) {
+                uint32_t keyRef = cpuBandBuf[base + i * 4];
+                uint32_t keySlot[4] = {cpuBandBuf[base+i*4], cpuBandBuf[base+i*4+1],
+                                       cpuBandBuf[base+i*4+2], cpuBandBuf[base+i*4+3]};
+                float keyVal = fmaxf(fmaxf(cpuCurveBuf[keyRef*4], cpuCurveBuf[keyRef*4+2]),
+                                     cpuCurveBuf[(keyRef+1)*4]);
+                uint32_t j = i;
+                while (j > 0) {
+                    uint32_t prevRef = cpuBandBuf[base + (j-1)*4];
+                    float prevVal = fmaxf(fmaxf(cpuCurveBuf[prevRef*4], cpuCurveBuf[prevRef*4+2]),
+                                          cpuCurveBuf[(prevRef+1)*4]);
+                    if (prevVal >= keyVal) break;
+                    memcpy(&cpuBandBuf[base+j*4], &cpuBandBuf[base+(j-1)*4], 16);
+                    j--;
+                }
+                memcpy(&cpuBandBuf[base+j*4], keySlot, 16);
+            }
+        }
+        for (int b = 0; b < SIGIL_BAND_CNT; b++) {
+            uint32_t cnt = vCnt[b];
+            uint32_t base = (bandDataBase + (SIGIL_BAND_CNT + (uint32_t)b) * nc) * 4;
+            for (uint32_t i = 1; i < cnt; i++) {
+                uint32_t keyRef = cpuBandBuf[base + i * 4];
+                uint32_t keySlot[4] = {cpuBandBuf[base+i*4], cpuBandBuf[base+i*4+1],
+                                       cpuBandBuf[base+i*4+2], cpuBandBuf[base+i*4+3]};
+                float keyVal = fmaxf(fmaxf(cpuCurveBuf[keyRef*4+1], cpuCurveBuf[keyRef*4+3]),
+                                     cpuCurveBuf[(keyRef+1)*4+1]);
+                uint32_t j = i;
+                while (j > 0) {
+                    uint32_t prevRef = cpuBandBuf[base + (j-1)*4];
+                    float prevVal = fmaxf(fmaxf(cpuCurveBuf[prevRef*4+1], cpuCurveBuf[prevRef*4+3]),
+                                          cpuCurveBuf[(prevRef+1)*4+1]);
+                    if (prevVal >= keyVal) break;
+                    memcpy(&cpuBandBuf[base+j*4], &cpuBandBuf[base+(j-1)*4], 16);
+                    j--;
+                }
+                memcpy(&cpuBandBuf[base+j*4], keySlot, 16);
+            }
+        }
+
+        /* Write band headers */
+        for (int b = 0; b < SIGIL_BAND_CNT; b++) {
+            uint32_t idx = (bandStart + (uint32_t)b) * 4;
+            cpuBandBuf[idx + 0] = hCnt[b];
+            cpuBandBuf[idx + 1] = 16 + (uint32_t)b * nc;
+            cpuBandBuf[idx + 2] = 0;
+            cpuBandBuf[idx + 3] = 0;
+        }
+        for (int b = 0; b < SIGIL_BAND_CNT; b++) {
+            uint32_t idx = (bandStart + SIGIL_BAND_CNT + (uint32_t)b) * 4;
+            cpuBandBuf[idx + 0] = vCnt[b];
+            cpuBandBuf[idx + 1] = 16 + (SIGIL_BAND_CNT + (uint32_t)b) * nc;
+            cpuBandBuf[idx + 2] = 0;
+            cpuBandBuf[idx + 3] = 0;
+        }
+    }
+    #undef SIGIL_BAND_CNT
+
+    /* 2c. Generate vertices + indices */
+    uint32_t vertFloats = ec * 4 * 28;
+    float *cpuVertBuf = (float *)calloc(vertFloats > 0 ? vertFloats : 1, sizeof(float));
+    uint32_t *cpuIdxBuf = (uint32_t *)calloc(ec * 6 > 0 ? ec * 6 : 1, sizeof(uint32_t));
+
+    for (uint32_t ei = 0; ei < ec; ei++) {
+        uint32_t *row = &elemData[ei * 22];
+        uint32_t nc = row[1];
+        float xMin, yMin, xMax, yMax;
+        memcpy(&xMin, &row[2], 4); memcpy(&yMin, &row[3], 4);
+        memcpy(&xMax, &row[4], 4); memcpy(&yMax, &row[5], 4);
+        float ew = xMax - xMin, eh = yMax - yMin;
+        float bsX = ew > 0 ? 8.0f / ew : 0.0f;
+        float bsY = eh > 0 ? 8.0f / eh : 0.0f;
+        float boX = -xMin * bsX, boY = -yMin * bsY;
+
+        float px0 = (xMin - vbX) * scale;
+        float py0 = (yMin - vbY) * scale;
+        float px1 = (xMax - vbX) * scale;
+        float py1 = (yMax - vbY) * scale;
+
+        uint32_t bandStart = offsetData[ei * 2 + 1];
+        uint32_t glpU32 = bandStart;
+        float glp; memcpy(&glp, &glpU32, 4);
+
+        uint32_t bandMaxPacked = (7u << 16u) | 7u;
+        if (row[10] == 1) bandMaxPacked |= (1u << 28u); /* evenodd */
+        float bmp; memcpy(&bmp, &bandMaxPacked, 4);
+
+        float fill_r, fill_g, fill_b, fill_a, opacity;
+        memcpy(&fill_r, &row[6], 4); memcpy(&fill_g, &row[7], 4);
+        memcpy(&fill_b, &row[8], 4); memcpy(&fill_a, &row[9], 4);
+        memcpy(&opacity, &row[12], 4);
+
+        float alpha = fill_a * opacity;
+        float cr = fill_r * alpha, cg = fill_g * alpha, cb = fill_b * alpha;
+
+        float g0[4], g1[4];
+        memcpy(g0, &row[14], 16);
+        memcpy(g1, &row[18], 16);
+
+        int32_t gradIdx; memcpy(&gradIdx, &row[11], 4);
+        if (gradIdx >= 0) {
+            cr = 0; cg = 0; cb = 0;
+            alpha = -opacity;
+        }
+
+        /* 4 corners: (px, py, nx, ny, emx, emy, glp, bmp, jac[4], bnd[4], col[4], grad0[4], grad1[4]) */
+        float corners[4][4] = {{px0,py0,-1,-1},{px1,py0,1,-1},{px1,py1,1,1},{px0,py1,-1,1}};
+        float emCoords[4][2] = {{xMin,yMin},{xMax,yMin},{xMax,yMax},{xMin,yMax}};
+
+        for (int v = 0; v < 4; v++) {
+            float *vp = &cpuVertBuf[(ei * 4 + (uint32_t)v) * 28];
+            vp[0] = corners[v][0]; vp[1] = corners[v][1];
+            vp[2] = corners[v][2]; vp[3] = corners[v][3];
+            vp[4] = emCoords[v][0]; vp[5] = emCoords[v][1];
+            vp[6] = glp; vp[7] = bmp;
+            vp[8] = invScale; vp[9] = 0; vp[10] = 0; vp[11] = invScale;
+            vp[12] = bsX; vp[13] = bsY; vp[14] = boX; vp[15] = boY;
+            vp[16] = cr; vp[17] = cg; vp[18] = cb; vp[19] = alpha;
+            vp[20] = g0[0]; vp[21] = g0[1]; vp[22] = g0[2]; vp[23] = g0[3];
+            vp[24] = g1[0]; vp[25] = g1[1]; vp[26] = g1[2]; vp[27] = g1[3];
+        }
+
+        uint32_t idxBase = ei * 6, vtxBase = ei * 4;
+        cpuIdxBuf[idxBase + 0] = vtxBase;
+        cpuIdxBuf[idxBase + 1] = vtxBase + 1;
+        cpuIdxBuf[idxBase + 2] = vtxBase + 2;
+        cpuIdxBuf[idxBase + 3] = vtxBase;
+        cpuIdxBuf[idxBase + 4] = vtxBase + 2;
+        cpuIdxBuf[idxBase + 5] = vtxBase + 3;
+    }
+
+    /* ---- 3. Upload CPU-generated buffers to GPU ---- */
+    if (curveOutVec4s > 0)
+        wgpuQueueWriteBuffer(queue, gs->curveBuf, 0, cpuCurveBuf, (size_t)curveOutVec4s * 16);
+    if (bandOutVec4s > 0)
+        wgpuQueueWriteBuffer(queue, gs->bandBuf, 0, cpuBandBuf, (size_t)bandOutVec4s * 16);
+    if (vertFloats > 0)
+        wgpuQueueWriteBuffer(queue, gs->vertexBuf, 0, cpuVertBuf, (size_t)vertFloats * sizeof(float));
+    if (ec > 0)
+        wgpuQueueWriteBuffer(queue, gs->indexBuf, 0, cpuIdxBuf, (size_t)ec * 6 * sizeof(uint32_t));
+
+    free(cpuCurveBuf);
+    free(cpuBandBuf);
+    free(cpuVertBuf);
+    free(cpuIdxBuf);
+
+    /* ---- 4. Create SigilDrawData ---- */
+    SigilDrawData *dd = (SigilDrawData *)calloc(1, sizeof *dd);
+    if (!dd) return NULL;
+
+    dd->indexCount = gs->elementCount * 6;
+    dd->vertexBuf  = gs->vertexBuf;   /* borrowed, not owned */
+    dd->indexBuf   = gs->indexBuf;     /* borrowed, not owned */
+
+    /* 80-byte uniform buffer (MVP + viewport size) */
+    dd->uniformBuffer = wgpuDeviceCreateBuffer(ctx->device,
+        &(WGPUBufferDescriptor){
+            .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+            .size  = 80
+        });
+
+    float ubo[20] = {
+         2.0f / viewport_w, 0, 0, -1.0f,
+         0, -2.0f / viewport_h, 0,  1.0f,
+         0, 0, 0, 0,
+         0, 0, 0, 1,
+         viewport_w, viewport_h, 0, 0,
+    };
+    wgpuQueueWriteBuffer(queue, dd->uniformBuffer, 0, ubo, sizeof ubo);
+
+    /* Render bind group: uniform + curveBuf + bandBuf + gradientView + sampler */
+    WGPUBindGroupEntry bgEntries[5] = {
+        {.binding = 0, .buffer = dd->uniformBuffer,
+         .size = 80},
+        {.binding = 1, .buffer = gs->curveBuf,
+         .size = wgpuBufferGetSize(gs->curveBuf)},
+        {.binding = 2, .buffer = gs->bandBuf,
+         .size = wgpuBufferGetSize(gs->bandBuf)},
+        {.binding = 3, .textureView = gs->gradientView},
+        {.binding = 4, .sampler = ctx->gradientSampler},
+    };
+    dd->renderBindGroup = wgpuDeviceCreateBindGroup(ctx->device,
+        &(WGPUBindGroupDescriptor){
+            .layout     = ctx->renderBGL,
+            .entryCount = 5,
+            .entries    = bgEntries
+        });
 
     return dd;
 }
+
+/* sigil_prepare removed — replaced by sigil_upload + sigil_prepare_gpu */
 
 /* ------------------------------------------------------------------ */
 /*  sigil_encode — record render pass commands                        */
@@ -3067,9 +3911,9 @@ void sigil_encode(SigilContext* ctx, SigilDrawData* data,
 
     WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(encoder, &rpDesc);
     wgpuRenderPassEncoderSetPipeline(rp, ctx->pipeline);
-    wgpuRenderPassEncoderSetBindGroup(rp, 0, data->bindGroup, 0, NULL);
-    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, data->vertexBuffer, 0, WGPU_WHOLE_SIZE);
-    wgpuRenderPassEncoderSetIndexBuffer(rp, data->indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderSetBindGroup(rp, 0, data->renderBindGroup, 0, NULL);
+    wgpuRenderPassEncoderSetVertexBuffer(rp, 0, data->vertexBuf, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderSetIndexBuffer(rp, data->indexBuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderDrawIndexed(rp, (uint32_t)data->indexCount, 1, 0, 0, 0);
     wgpuRenderPassEncoderEnd(rp);
     wgpuRenderPassEncoderRelease(rp);
@@ -3081,23 +3925,9 @@ void sigil_encode(SigilContext* ctx, SigilDrawData* data,
 
 void sigil_free_draw_data(SigilDrawData* data) {
     if (!data) return;
-    if (data->bindGroup)        wgpuBindGroupRelease(data->bindGroup);
-    if (data->curveView)        wgpuTextureViewRelease(data->curveView);
-    if (data->bandView)         wgpuTextureViewRelease(data->bandView);
-    if (data->gradientView)     wgpuTextureViewRelease(data->gradientView);
-    if (data->gradientSampler)  wgpuSamplerRelease(data->gradientSampler);
-    if (data->curveTexture)     wgpuTextureDestroy(data->curveTexture);
-    if (data->curveTexture)     wgpuTextureRelease(data->curveTexture);
-    if (data->bandTexture)      wgpuTextureDestroy(data->bandTexture);
-    if (data->bandTexture)      wgpuTextureRelease(data->bandTexture);
-    if (data->gradientTexture)  wgpuTextureDestroy(data->gradientTexture);
-    if (data->gradientTexture)  wgpuTextureRelease(data->gradientTexture);
-    if (data->vertexBuffer)     wgpuBufferDestroy(data->vertexBuffer);
-    if (data->vertexBuffer)     wgpuBufferRelease(data->vertexBuffer);
-    if (data->indexBuffer)      wgpuBufferDestroy(data->indexBuffer);
-    if (data->indexBuffer)      wgpuBufferRelease(data->indexBuffer);
-    if (data->uniformBuffer)    wgpuBufferDestroy(data->uniformBuffer);
-    if (data->uniformBuffer)    wgpuBufferRelease(data->uniformBuffer);
+    if (data->renderBindGroup) wgpuBindGroupRelease(data->renderBindGroup);
+    if (data->uniformBuffer) { wgpuBufferDestroy(data->uniformBuffer); wgpuBufferRelease(data->uniformBuffer); }
+    /* vertexBuf and indexBuf are NOT released — owned by SigilGPUScene */
     free(data);
 }
 
@@ -3134,11 +3964,24 @@ void sigil_free_scene(SigilScene* scene) {
 
 void sigil_destroy(SigilContext* ctx) {
     if (!ctx) return;
-    if (ctx->pipeline)        wgpuRenderPipelineRelease(ctx->pipeline);
-    if (ctx->pipelineLayout)  wgpuPipelineLayoutRelease(ctx->pipelineLayout);
-    if (ctx->bindGroupLayout) wgpuBindGroupLayoutRelease(ctx->bindGroupLayout);
-    if (ctx->vertexShader)    wgpuShaderModuleRelease(ctx->vertexShader);
-    if (ctx->fragmentShader)  wgpuShaderModuleRelease(ctx->fragmentShader);
+    /* Render pipeline */
+    if (ctx->pipeline)              wgpuRenderPipelineRelease(ctx->pipeline);
+    if (ctx->renderPipelineLayout)  wgpuPipelineLayoutRelease(ctx->renderPipelineLayout);
+    if (ctx->renderBGL)             wgpuBindGroupLayoutRelease(ctx->renderBGL);
+    if (ctx->vertexShader)          wgpuShaderModuleRelease(ctx->vertexShader);
+    if (ctx->fragmentShader)        wgpuShaderModuleRelease(ctx->fragmentShader);
+    /* Compute pipelines */
+    if (ctx->preparePipeline)       wgpuComputePipelineRelease(ctx->preparePipeline);
+    if (ctx->gradientPipeline)      wgpuComputePipelineRelease(ctx->gradientPipeline);
+    if (ctx->preparePipelineLayout) wgpuPipelineLayoutRelease(ctx->preparePipelineLayout);
+    if (ctx->gradientPipelineLayout)wgpuPipelineLayoutRelease(ctx->gradientPipelineLayout);
+    if (ctx->prepareInputBGL)       wgpuBindGroupLayoutRelease(ctx->prepareInputBGL);
+    if (ctx->prepareOutputBGL)      wgpuBindGroupLayoutRelease(ctx->prepareOutputBGL);
+    if (ctx->gradientBGL)           wgpuBindGroupLayoutRelease(ctx->gradientBGL);
+    if (ctx->prepareShader)         wgpuShaderModuleRelease(ctx->prepareShader);
+    if (ctx->gradientShader)        wgpuShaderModuleRelease(ctx->gradientShader);
+    /* Shared */
+    if (ctx->gradientSampler)       wgpuSamplerRelease(ctx->gradientSampler);
     free(ctx);
 }
 

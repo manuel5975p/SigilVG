@@ -310,6 +310,125 @@ TEST(test_stroke_generates_fill) {
 }
 
 /* ================================================================== */
+/*  Stroke join/cap tests                                             */
+/* ================================================================== */
+
+TEST(test_stroke_miter_join) {
+    /* V-shape: miter join should extend above the vertex */
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 20 170 L 100 30 L 180 170\" fill=\"none\" stroke=\"green\" stroke-width=\"20\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    /* Miter join should extend above y=30 (the vertex) */
+    ASSERT(scene->elements[0].bounds.yMin < 30.0f);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_bevel_join) {
+    /* Same V-shape with bevel: no miter spike */
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 20 170 L 100 30 L 180 170\" fill=\"none\" stroke=\"green\" stroke-width=\"20\" stroke-linejoin=\"bevel\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    /* Bevel join should NOT extend far above the vertex */
+    ASSERT(scene->elements[0].bounds.yMin >= 18.0f); /* at most half-width above vertex */
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_round_join) {
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 20 170 L 100 30 L 180 170\" fill=\"none\" stroke=\"green\" stroke-width=\"20\" stroke-linejoin=\"round\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    /* Round join bounded by half-width circle around vertex */
+    ASSERT(scene->elements[0].bounds.yMin >= 18.0f);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_square_cap) {
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 50 100 L 150 100\" fill=\"none\" stroke=\"red\" stroke-width=\"20\" stroke-linecap=\"square\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    /* Square cap extends 10px (half-width) past endpoints */
+    ASSERT(scene->elements[0].bounds.xMin < 50.0f);
+    ASSERT(scene->elements[0].bounds.xMax > 150.0f);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_round_cap) {
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 50 100 L 150 100\" fill=\"none\" stroke=\"red\" stroke-width=\"20\" stroke-linecap=\"round\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    /* Round cap extends half-width past endpoints */
+    ASSERT(scene->elements[0].bounds.xMin < 50.0f);
+    ASSERT(scene->elements[0].bounds.xMax > 150.0f);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_group_inherit_linejoin) {
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <g stroke-linejoin=\"bevel\">"
+        "    <path d=\"M 20 170 L 100 30 L 180 170\" fill=\"none\" stroke=\"green\" stroke-width=\"20\"/>"
+        "  </g>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    /* Should be bevel (inherited), so no miter spike */
+    ASSERT(scene->elements[0].bounds.yMin >= 18.0f);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_closed_path) {
+    /* Closed triangle: all vertices should have joins */
+    const char *svg =
+        "<svg viewBox=\"0 0 200 200\">"
+        "  <path d=\"M 50 150 L 100 50 L 150 150 Z\" fill=\"none\" stroke=\"blue\" stroke-width=\"10\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    sigil_free_scene(scene);
+}
+
+TEST(test_stroke_miter_limit) {
+    /* Very acute angle with low miter limit should fall back to bevel */
+    const char *svg =
+        "<svg viewBox=\"0 0 400 200\">"
+        "  <path d=\"M 20 100 L 200 10 L 20 20\" fill=\"none\" stroke=\"green\" stroke-width=\"10\" stroke-miterlimit=\"1\"/>"
+        "</svg>";
+    SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
+    ASSERT(scene != NULL);
+    ASSERT(scene->element_count == 1);
+    ASSERT(scene->elements[0].curve_count > 0);
+    sigil_free_scene(scene);
+}
+
+/* ================================================================== */
 /*  Integration tests                                                 */
 /* ================================================================== */
 
@@ -374,6 +493,16 @@ int main(void) {
     RUN(test_parse_color_names);
     RUN(test_parse_fill_rule);
     RUN(test_stroke_generates_fill);
+
+    printf("\n-- Stroke join/cap tests --\n");
+    RUN(test_stroke_miter_join);
+    RUN(test_stroke_bevel_join);
+    RUN(test_stroke_round_join);
+    RUN(test_stroke_square_cap);
+    RUN(test_stroke_round_cap);
+    RUN(test_stroke_group_inherit_linejoin);
+    RUN(test_stroke_closed_path);
+    RUN(test_stroke_miter_limit);
 
     printf("\n-- Integration tests --\n");
     RUN(test_integration_multi_element);

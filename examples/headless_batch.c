@@ -145,11 +145,17 @@ static unsigned char *render_one(GPU *gpu, SigilContext *ctx,
         return NULL;
     }
 
-    SigilDrawData *dd = sigil_prepare(ctx, scene, (float)W, (float)H, false);
-    if (!dd) {
-        sigil_free_scene(scene);
-        return NULL;
-    }
+    SigilGPUScene *gpuScene = sigil_upload(ctx, scene);
+    if (!gpuScene) { sigil_free_scene(scene); return NULL; }
+
+    WGPUCommandEncoder prepEnc = wgpuDeviceCreateCommandEncoder(gpu->device, NULL);
+    SigilDrawData *dd = sigil_prepare_gpu(ctx, gpuScene, prepEnc, (float)W, (float)H);
+    WGPUCommandBuffer prepCb = wgpuCommandEncoderFinish(prepEnc, NULL);
+    wgpuQueueSubmit(gpu->queue, 1, &prepCb);
+    wgpuCommandBufferRelease(prepCb);
+    wgpuCommandEncoderRelease(prepEnc);
+
+    if (!dd) { sigil_free_gpu_scene(gpuScene); sigil_free_scene(scene); return NULL; }
 
     /* Render target */
     WGPUTexture rt = wgpuDeviceCreateTexture(gpu->device,
@@ -216,6 +222,7 @@ static unsigned char *render_one(GPU *gpu, SigilContext *ctx,
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
     sigil_free_draw_data(dd);
+    sigil_free_gpu_scene(gpuScene);
     sigil_free_scene(scene);
 
     /* Advance frame — resets WGVK's per-frame submit counter (max 100 submits per frame) */

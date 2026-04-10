@@ -98,8 +98,17 @@ static unsigned char *render_svg(GPU *gpu, SigilContext *ctx,
     SigilScene *scene = sigil_parse_svg(svg_data, svg_len);
     if (!scene || scene->element_count == 0) { sigil_free_scene(scene); return NULL; }
 
-    SigilDrawData *dd = sigil_prepare(ctx, scene, (float)w, (float)h, false);
-    if (!dd) { sigil_free_scene(scene); return NULL; }
+    SigilGPUScene *gpuScene = sigil_upload(ctx, scene);
+    if (!gpuScene) { sigil_free_scene(scene); return NULL; }
+
+    WGPUCommandEncoder prepEnc = wgpuDeviceCreateCommandEncoder(gpu->device, NULL);
+    SigilDrawData *dd = sigil_prepare_gpu(ctx, gpuScene, prepEnc, (float)w, (float)h);
+    WGPUCommandBuffer prepCb = wgpuCommandEncoderFinish(prepEnc, NULL);
+    wgpuQueueSubmit(gpu->queue, 1, &prepCb);
+    wgpuCommandBufferRelease(prepCb);
+    wgpuCommandEncoderRelease(prepEnc);
+
+    if (!dd) { sigil_free_gpu_scene(gpuScene); sigil_free_scene(scene); return NULL; }
 
     WGPUTexture rt = wgpuDeviceCreateTexture(gpu->device,
         &(WGPUTextureDescriptor){
@@ -160,6 +169,7 @@ static unsigned char *render_svg(GPU *gpu, SigilContext *ctx,
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
     sigil_free_draw_data(dd);
+    sigil_free_gpu_scene(gpuScene);
     sigil_free_scene(scene);
     return pixels;
 }

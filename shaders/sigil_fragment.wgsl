@@ -5,21 +5,6 @@
 // ===================================================
 
 
-// The curve and band textures use a fixed width of 4096 texels.
-
-const kLogBandTextureWidth: u32 = 12u;
-
-// It's convenient to have a texel load function to aid in translation to other shader languages.
-
-fn TexelLoad2D_f32(tex: texture_2d<f32>, coords: vec2<i32>) -> vec4<f32> {
-    return textureLoad(tex, coords, 0);
-}
-
-fn TexelLoad2D_u32(tex: texture_2d<u32>, coords: vec2<i32>) -> vec4<u32> {
-    return textureLoad(tex, coords, 0);
-}
-
-
 fn CalcRootCode(y1: f32, y2: f32, y3: f32) -> u32 {
     // Calculate the root eligibility code for a sample-relative quadratic Bezier curve.
     // Extract the signs of the y coordinates of the three control points.
@@ -71,13 +56,6 @@ fn SolveVertPoly(p12: vec4<f32>, p3: vec2<f32>) -> vec2<f32> {
     return vec2<f32>((a.y * t1 - b.y * 2.0) * t1 + p12.y, (a.y * t2 - b.y * 2.0) * t2 + p12.y);
 }
 
-fn CalcBandLoc(glyphLoc: vec2<i32>, offset: u32) -> vec2<i32> {
-    var bandLoc = vec2<i32>(glyphLoc.x + i32(offset), glyphLoc.y);
-    bandLoc.y += bandLoc.x >> kLogBandTextureWidth;
-    bandLoc.x &= (1 << kLogBandTextureWidth) - 1;
-    return bandLoc;
-}
-
 override SLUG_EVENODD: bool = true;
 override SLUG_WEIGHT: bool = false;
 
@@ -101,7 +79,7 @@ fn CalcCoverage(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32, flags: i32) -> f32 {
     return coverage;
 }
 
-fn SlugRender(curveData: texture_2d<f32>, bandData: texture_2d<u32>, renderCoord: vec2<f32>, bandTransform: vec4<f32>, glyphData: vec4<i32>) -> f32 {
+fn SlugRender(renderCoord: vec2<f32>, bandTransform: vec4<f32>, glyphData: vec4<i32>) -> f32 {
     var curveIndex: i32;
 
     let emsPerPixel = fwidth(renderCoord);
@@ -110,18 +88,18 @@ fn SlugRender(curveData: texture_2d<f32>, bandData: texture_2d<u32>, renderCoord
     var bandMax = vec2<i32>(glyphData.z, glyphData.w & 0x00FF);
 
     let bandIndex = clamp(vec2<i32>(renderCoord * bandTransform.xy + bandTransform.zw), vec2<i32>(0, 0), bandMax);
-    let glyphLoc = vec2<i32>(glyphData.x, glyphData.y);
+    let glyphOffset = u32(glyphData.x);
 
     var xcov: f32 = 0.0;
     var xwgt: f32 = 0.0;
 
-    let hbandData = TexelLoad2D_u32(bandData, vec2<i32>(glyphLoc.x + bandIndex.y, glyphLoc.y)).xy;
-    let hbandLoc = CalcBandLoc(glyphLoc, hbandData.y);
+    let hbandData = bandBuf[glyphOffset + u32(bandIndex.y)].xy;
+    let hbandOff = glyphOffset + hbandData.y;
 
     for (curveIndex = 0; curveIndex < i32(hbandData.x); curveIndex++) {
-        let curveLoc = vec2<i32>(TexelLoad2D_u32(bandData, vec2<i32>(hbandLoc.x + curveIndex, hbandLoc.y)).xy);
-        let p12 = TexelLoad2D_f32(curveData, curveLoc) - vec4<f32>(renderCoord, renderCoord);
-        let p3 = TexelLoad2D_f32(curveData, vec2<i32>(curveLoc.x + 1, curveLoc.y)).xy - renderCoord;
+        let curveRef = bandBuf[hbandOff + u32(curveIndex)].x;
+        let p12 = curveBuf[curveRef] - vec4<f32>(renderCoord, renderCoord);
+        let p3 = curveBuf[curveRef + 1u].xy - renderCoord;
 
         if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) {
             break;
@@ -146,13 +124,13 @@ fn SlugRender(curveData: texture_2d<f32>, bandData: texture_2d<u32>, renderCoord
     var ycov: f32 = 0.0;
     var ywgt: f32 = 0.0;
 
-    let vbandData = TexelLoad2D_u32(bandData, vec2<i32>(glyphLoc.x + bandMax.y + 1 + bandIndex.x, glyphLoc.y)).xy;
-    let vbandLoc = CalcBandLoc(glyphLoc, vbandData.y);
+    let vbandData = bandBuf[glyphOffset + u32(bandMax.y) + 1u + u32(bandIndex.x)].xy;
+    let vbandOff = glyphOffset + vbandData.y;
 
     for (curveIndex = 0; curveIndex < i32(vbandData.x); curveIndex++) {
-        let curveLoc = vec2<i32>(TexelLoad2D_u32(bandData, vec2<i32>(vbandLoc.x + curveIndex, vbandLoc.y)).xy);
-        let p12 = TexelLoad2D_f32(curveData, curveLoc) - vec4<f32>(renderCoord, renderCoord);
-        let p3 = TexelLoad2D_f32(curveData, vec2<i32>(curveLoc.x + 1, curveLoc.y)).xy - renderCoord;
+        let curveRef = bandBuf[vbandOff + u32(curveIndex)].x;
+        let p12 = curveBuf[curveRef] - vec4<f32>(renderCoord, renderCoord);
+        let p3 = curveBuf[curveRef + 1u].xy - renderCoord;
 
         if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
             break;
@@ -205,14 +183,14 @@ struct VertexStruct {
     @location(5) @interpolate(flat) grad1: vec4<f32>,    // Gradient params 1.
 };
 
-@group(0) @binding(1) var curveTexture: texture_2d<f32>;     // Control point texture.
-@group(0) @binding(2) var bandTexture: texture_2d<u32>;      // Band data texture.
-@group(0) @binding(3) var gradientTexture: texture_2d<f32>;  // Gradient ramp texture.
-@group(0) @binding(4) var gradientSampler: sampler;          // Linear sampler for gradients.
+@group(0) @binding(1) var<storage, read> curveBuf : array<vec4<f32>>;  // Control point storage buffer.
+@group(0) @binding(2) var<storage, read> bandBuf  : array<vec4<u32>>;  // Band data storage buffer.
+@group(0) @binding(3) var gradientTexture: texture_2d<f32>;            // Gradient ramp texture.
+@group(0) @binding(4) var gradientSampler: sampler;                    // Linear sampler for gradients.
 
 @fragment
 fn main(vresult: VertexStruct) -> @location(0) vec4<f32> {
-    let coverage = SlugRender(curveTexture, bandTexture, vresult.texcoord, vresult.banding, vresult.glyph);
+    let coverage = SlugRender(vresult.texcoord, vresult.banding, vresult.glyph);
 
     // Check if this is a gradient fill (negative alpha signals gradient mode)
     if (vresult.color.a < 0.0) {

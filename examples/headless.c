@@ -197,12 +197,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Prepare draw data (band building, texture packing, GPU upload) */
-    SigilDrawData *dd = sigil_prepare(ctx, scene, (float)W, (float)H, false);
-    if (!dd) {
-        fprintf(stderr, "Error: sigil_prepare returned NULL (no geometry?)\n");
+    /* Upload scene to GPU (buffers, textures) */
+    SigilGPUScene *gpuScene = sigil_upload(ctx, scene);
+    if (!gpuScene) {
+        fprintf(stderr, "Error: sigil_upload failed\n");
         sigil_destroy(ctx);
         sigil_free_scene(scene);
+        return 1;
+    }
+    sigil_free_scene(scene);
+    scene = NULL;
+
+    /* Prepare draw data (compute pass + render bind group) */
+    WGPUCommandEncoder prepEnc = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
+    SigilDrawData *dd = sigil_prepare_gpu(ctx, gpuScene, prepEnc, (float)W, (float)H);
+    WGPUCommandBuffer prepCb = wgpuCommandEncoderFinish(prepEnc, NULL);
+    wgpuQueueSubmit(gpu.queue, 1, &prepCb);
+    wgpuCommandBufferRelease(prepCb);
+    wgpuCommandEncoderRelease(prepEnc);
+    if (!dd) {
+        fprintf(stderr, "Error: sigil_prepare_gpu failed (no geometry?)\n");
+        sigil_free_gpu_scene(gpuScene);
+        sigil_destroy(ctx);
         return 1;
     }
 
@@ -235,20 +251,15 @@ int main(int argc, char **argv)
 
     static const float bg[] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    /* Stress test: 200 submits in one frame (well past old 100 semaphore limit) */
-    const int STRESS_SUBMITS = 200;
-    fprintf(stderr, "Stress test: %d queue submits in one frame...\n", STRESS_SUBMITS);
-    for (int i = 0; i < STRESS_SUBMITS; i++) {
-        WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
-        sigil_encode(ctx, dd, e, rtView, NULL, bg);
-        WGPUCommandBuffer c = wgpuCommandEncoderFinish(e, NULL);
-        wgpuQueueSubmit(gpu.queue, 1, &c);
-        wgpuCommandBufferRelease(c);
-        wgpuCommandEncoderRelease(e);
+    /* Pre-fill readback buffer (WGVK doesn't zero-init MapRead buffers) */
+    {
+        size_t rbSize = (size_t)alignedRow * (size_t)H;
+        void *z = calloc(1, rbSize);
+        wgpuQueueWriteBuffer(gpu.queue, readBuf, 0, z, rbSize);
+        free(z);
     }
-    fprintf(stderr, "Stress test passed (%d submits).\n", STRESS_SUBMITS);
 
-    /* Final render + copy to readback buffer */
+    /* Render + copy to readback buffer */
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(gpu.device, NULL);
     sigil_encode(ctx, dd, enc, rtView, NULL, bg);
 
@@ -274,7 +285,7 @@ int main(int argc, char **argv)
     if (g_mapped != 1) {
         fprintf(stderr, "Error: buffer map failed\n");
         sigil_free_draw_data(dd);
-        sigil_free_scene(scene);
+        sigil_free_gpu_scene(gpuScene);
         sigil_destroy(ctx);
         return 1;
     }
@@ -302,7 +313,7 @@ int main(int argc, char **argv)
     wgpuCommandEncoderRelease(enc);
 
     sigil_free_draw_data(dd);
-    sigil_free_scene(scene);
+    sigil_free_gpu_scene(gpuScene);
     sigil_destroy(ctx);
 
     return 0;

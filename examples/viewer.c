@@ -58,6 +58,7 @@ typedef struct {
     wgpu_base     base;
     SigilContext  *sigil;
     SigilScene   *scene;
+    SigilGPUScene *gpuScene;
     SigilDrawData *drawData;
     int            lastWidth;
     int            lastHeight;
@@ -208,8 +209,18 @@ static void rebuild_draw_data(ViewerCtx *ctx, int width, int height)
         sigil_free_draw_data(ctx->drawData);
         ctx->drawData = NULL;
     }
-    ctx->drawData = sigil_prepare(ctx->sigil, ctx->scene,
-                                  (float)width, (float)height, false);
+    if (!ctx->gpuScene) {
+        ctx->gpuScene = sigil_upload(ctx->sigil, ctx->scene);
+        if (!ctx->gpuScene) return;
+    }
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(ctx->base.device, NULL);
+    ctx->drawData = sigil_prepare_gpu(ctx->sigil, ctx->gpuScene, enc,
+                                       (float)width, (float)height);
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
+    wgpuQueueSubmit(ctx->base.queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(enc);
+
     ctx->lastWidth  = width;
     ctx->lastHeight = height;
     ctx->cam_x = (float)width  * 0.5f;
@@ -356,6 +367,7 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     sigil_free_draw_data(ctx.drawData);
+    sigil_free_gpu_scene(ctx.gpuScene);
     sigil_free_scene(ctx.scene);
     sigil_destroy(ctx.sigil);
 

@@ -46,6 +46,7 @@ typedef struct {
     GLFWwindow     *window;
     SigilContext   *sigil;
     SigilScene    *scene;
+    SigilGPUScene *gpuScene;
     SigilDrawData *drawData;
     int            width;
     int            height;
@@ -94,8 +95,21 @@ static void rebuild(AppCtx *app)
         sigil_free_draw_data(app->drawData);
         app->drawData = NULL;
     }
-    app->drawData = sigil_prepare(app->sigil, app->scene,
-                                  (float)app->width, (float)app->height, false);
+    if (app->gpuScene) {
+        sigil_free_gpu_scene(app->gpuScene);
+        app->gpuScene = NULL;
+    }
+    app->gpuScene = sigil_upload(app->sigil, app->scene);
+    if (!app->gpuScene) return;
+
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(app->device, NULL);
+    app->drawData = sigil_prepare_gpu(app->sigil, app->gpuScene, enc,
+                                      (float)app->width, (float)app->height);
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
+    wgpuQueueSubmit(app->queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(enc);
+
     reset_camera(app);
     update_ubo(app);
 }
@@ -114,6 +128,7 @@ static int load_svg(AppCtx *app, const char *svg, size_t len)
     }
     /* Replace current scene */
     if (app->drawData) { sigil_free_draw_data(app->drawData); app->drawData = NULL; }
+    if (app->gpuScene) { sigil_free_gpu_scene(app->gpuScene); app->gpuScene = NULL; }
     if (app->scene) sigil_free_scene(app->scene);
     app->scene = scene;
     rebuild(app);

@@ -156,8 +156,17 @@ static int sigil_render(const char *svg, int w, int h, Image *out) {
     SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
     if (!scene || scene->element_count == 0) { sigil_free_scene(scene); return 0; }
 
-    SigilDrawData *dd = sigil_prepare(g_sigil, scene, (float)w, (float)h, false);
-    if (!dd) { sigil_free_scene(scene); return 0; }
+    SigilGPUScene *gpuScene = sigil_upload(g_sigil, scene);
+    if (!gpuScene) { sigil_free_scene(scene); return 0; }
+
+    WGPUCommandEncoder prepEnc = wgpuDeviceCreateCommandEncoder(g_gpu.device, NULL);
+    SigilDrawData *dd = sigil_prepare_gpu(g_sigil, gpuScene, prepEnc, (float)w, (float)h);
+    WGPUCommandBuffer prepCb = wgpuCommandEncoderFinish(prepEnc, NULL);
+    wgpuQueueSubmit(g_gpu.queue, 1, &prepCb);
+    wgpuCommandBufferRelease(prepCb);
+    wgpuCommandEncoderRelease(prepEnc);
+
+    if (!dd) { sigil_free_gpu_scene(gpuScene); sigil_free_scene(scene); return 0; }
 
     /* Render target */
     WGPUTexture rt = wgpuDeviceCreateTexture(g_gpu.device,
@@ -183,6 +192,14 @@ static int sigil_render(const char *svg, int w, int h, Image *out) {
             .size = (uint64_t)alignedRow * h,
             .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
         });
+
+    /* Pre-fill readback buffer (WGVK doesn't zero-init MapRead buffers) */
+    {
+        size_t rbSize = (size_t)alignedRow * (size_t)h;
+        void *z = calloc(1, rbSize);
+        wgpuQueueWriteBuffer(g_gpu.queue, rbuf, 0, z, rbSize);
+        free(z);
+    }
 
     /* Encode + submit */
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_gpu.device, NULL);
@@ -223,6 +240,7 @@ static int sigil_render(const char *svg, int w, int h, Image *out) {
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
     sigil_free_draw_data(dd);
+    sigil_free_gpu_scene(gpuScene);
     sigil_free_scene(scene);
     return ok;
 }

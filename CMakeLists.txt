@@ -97,6 +97,8 @@ if(NOT EMSCRIPTEN)
 
     configure_file(shaders/sigil_vertex.wgsl ${CMAKE_CURRENT_BINARY_DIR}/sigil_vertex.wgsl COPYONLY)
     configure_file(shaders/sigil_fragment.wgsl ${CMAKE_CURRENT_BINARY_DIR}/sigil_fragment.wgsl COPYONLY)
+    configure_file(shaders/sigil_prepare_compute.wgsl ${CMAKE_CURRENT_BINARY_DIR}/sigil_prepare_compute.wgsl COPYONLY)
+    configure_file(shaders/sigil_bake_gradient.wgsl ${CMAKE_CURRENT_BINARY_DIR}/sigil_bake_gradient.wgsl COPYONLY)
 
     # --- PlutoVG / PlutoSVG reference renderer ---
     set(PLUTOVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -148,6 +150,7 @@ if(NOT EMSCRIPTEN)
     if(NOT MSVC)
         target_link_libraries(sigilvg_batch_pixel PRIVATE m)
     endif()
+
 endif()
 
 # --- Emscripten web demo ---
@@ -171,6 +174,8 @@ if(EMSCRIPTEN)
     target_link_options(sigilvg_web_demo PRIVATE
         "SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sigil_vertex.wgsl@sigil_vertex.wgsl"
         "SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sigil_fragment.wgsl@sigil_fragment.wgsl"
+        "SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sigil_prepare_compute.wgsl@sigil_prepare_compute.wgsl"
+        "SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sigil_bake_gradient.wgsl@sigil_bake_gradient.wgsl"
     )
 
     # Custom HTML shell with drag-and-drop UI
