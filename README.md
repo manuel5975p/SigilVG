@@ -35,12 +35,16 @@ This fetches all dependencies automatically (WGVK, GLFW, stb headers, PlutoSVG f
 
 ### 2. Run
 
+Run from the build directory (shader files live there):
+
 ```sh
+cd build
+
 # Headless render to PNG
-./build/sigilvg_headless my_drawing.svg output.png
+./sigilvg_headless ../my_drawing.svg output.png
 
 # Interactive viewer with pan/zoom
-./build/sigilvg_viewer my_drawing.svg
+./sigilvg_viewer ../my_drawing.svg
 ```
 
 **Viewer controls:** scroll to zoom, middle/right drag to pan, R to reset, Escape to quit.
@@ -48,9 +52,9 @@ This fetches all dependencies automatically (WGVK, GLFW, stb headers, PlutoSVG f
 ### 3. Try the demos
 
 ```sh
-./build/sigilvg_headless demos/gradient_scene.svg sunset.png
-./build/sigilvg_headless demos/shapes.svg shapes.png
-./build/sigilvg_viewer demos/shapes.svg
+./sigilvg_headless ../demos/gradient_scene.svg sunset.png
+./sigilvg_headless ../demos/shapes.svg shapes.png
+./sigilvg_viewer ../demos/shapes.svg
 ```
 
 ## Using the library

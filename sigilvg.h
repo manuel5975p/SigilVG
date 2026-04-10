@@ -2466,21 +2466,33 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
     ctx->colorFormat = colorFormat;
     ctx->depthFormat = depthFormat;
 
-    /* Load shaders — check SIGIL_SHADER_PATH env var, else current directory */
+    /* Load shaders — check SIGIL_SHADER_PATH env var, else current directory,
+       then fall back to parent directory */
     const char *shaderDir = getenv("SIGIL_SHADER_PATH");
     char vsPath[1024], fsPath[1024];
+    char *vsSrc = NULL, *fsSrc = NULL;
     if (shaderDir && shaderDir[0]) {
         snprintf(vsPath, sizeof vsPath, "%s/sigil_vertex.wgsl", shaderDir);
         snprintf(fsPath, sizeof fsPath, "%s/sigil_fragment.wgsl", shaderDir);
-    } else {
+        vsSrc = sigil__read_file(vsPath);
+        fsSrc = sigil__read_file(fsPath);
+    }
+    if (!vsSrc || !fsSrc) {
+        free(vsSrc); free(fsSrc);
         snprintf(vsPath, sizeof vsPath, "sigil_vertex.wgsl");
         snprintf(fsPath, sizeof fsPath, "sigil_fragment.wgsl");
+        vsSrc = sigil__read_file(vsPath);
+        fsSrc = sigil__read_file(fsPath);
     }
-
-    char *vsSrc = sigil__read_file(vsPath);
-    char *fsSrc = sigil__read_file(fsPath);
     if (!vsSrc || !fsSrc) {
-        fprintf(stderr, "sigil_create: shader files not found (%s, %s)\n", vsPath, fsPath);
+        free(vsSrc); free(fsSrc);
+        snprintf(vsPath, sizeof vsPath, "../sigil_vertex.wgsl");
+        snprintf(fsPath, sizeof fsPath, "../sigil_fragment.wgsl");
+        vsSrc = sigil__read_file(vsPath);
+        fsSrc = sigil__read_file(fsPath);
+    }
+    if (!vsSrc || !fsSrc) {
+        fprintf(stderr, "sigil_create: shader files not found (searched CWD, ../, SIGIL_SHADER_PATH)\n");
         free(vsSrc); free(fsSrc); free(ctx);
         return NULL;
     }
