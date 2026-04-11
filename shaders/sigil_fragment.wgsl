@@ -197,7 +197,6 @@ fn main(vresult: VertexStruct) -> @location(0) vec4<f32> {
         let opacity = -vresult.color.a;
         let gradType = i32(vresult.grad1.y);
         let gradRow = vresult.grad1.x;
-        let spread = i32(vresult.grad1.w);
 
         var t: f32 = 0.0;
 
@@ -211,16 +210,26 @@ fn main(vresult: VertexStruct) -> @location(0) vec4<f32> {
                 t = dot(vresult.texcoord - p1, d) / len2;
             }
         } else {
-            // Radial gradient
+            // Radial gradient with focal point and focal radius (SVG 2)
             let center = vresult.grad0.xy;
             let focal = vresult.grad0.zw;
             let radius = vresult.grad1.z;
+            let spread_fr = vresult.grad1.w;
+            let fr_ratio = fract(spread_fr) * 1000.0;
+            let focal_radius = fr_ratio * radius;
+
             if (radius > 0.0) {
                 let dist = length(vresult.texcoord - center);
-                t = dist / radius;
+                if (focal_radius > 0.0) {
+                    // SVG 2 focal radius: t=0 at focal circle, t=1 at outer circle
+                    t = (dist - focal_radius) / (radius - focal_radius);
+                } else {
+                    t = dist / radius;
+                }
             }
         }
 
+        let spread = i32(floor(vresult.grad1.w));
         t = applySpread(t, spread);
 
         // Sample gradient ramp texture

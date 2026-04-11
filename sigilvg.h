@@ -151,6 +151,7 @@ typedef struct {
     int objectBBox;               /* 1 = objectBoundingBox, 0 = userSpaceOnUse */
     int spread;                   /* 0=pad, 1=reflect, 2=repeat */
     char href[128];               /* xlink:href for attribute inheritance */
+    uint32_t attrs_set;           /* bitmask of explicitly set attributes */
 } SigilGradientDef;
 
 typedef struct {
@@ -180,26 +181,111 @@ static SigilGradientDef* sigil__grad_array_push(SigilGradientArray *a) {
     return g;
 }
 
-/* Resolve xlink:href inheritance between gradients */
+/* Check if a gradient attribute was explicitly set during parsing.
+   We use sentinel values to detect unset attributes:
+   - linear: x1/y1 defaults are 0, x2 default is 1 — but these are also valid values,
+     so we need a separate tracking mechanism.
+   We store a bitmask of which attributes were explicitly set. */
+#define SIGIL_GRAD_HAS_X1      (1<<0)
+#define SIGIL_GRAD_HAS_Y1      (1<<1)
+#define SIGIL_GRAD_HAS_X2      (1<<2)
+#define SIGIL_GRAD_HAS_Y2      (1<<3)
+#define SIGIL_GRAD_HAS_CX      (1<<4)
+#define SIGIL_GRAD_HAS_CY      (1<<5)
+#define SIGIL_GRAD_HAS_R       (1<<6)
+#define SIGIL_GRAD_HAS_FX      (1<<7)
+#define SIGIL_GRAD_HAS_FY      (1<<8)
+#define SIGIL_GRAD_HAS_FR      (1<<9)
+#define SIGIL_GRAD_HAS_UNITS   (1<<10)
+#define SIGIL_GRAD_HAS_SPREAD  (1<<11)
+#define SIGIL_GRAD_HAS_XFORM   (1<<12)
+/* Percent flags: set when an explicit value used '%' suffix */
+#define SIGIL_GRAD_PCT_X1      (1<<13)
+#define SIGIL_GRAD_PCT_Y1      (1<<14)
+#define SIGIL_GRAD_PCT_X2      (1<<15)
+#define SIGIL_GRAD_PCT_Y2      (1<<16)
+#define SIGIL_GRAD_PCT_CX      (1<<17)
+#define SIGIL_GRAD_PCT_CY      (1<<18)
+#define SIGIL_GRAD_PCT_R       (1<<19)
+#define SIGIL_GRAD_PCT_FX      (1<<20)
+#define SIGIL_GRAD_PCT_FY      (1<<21)
+#define SIGIL_GRAD_PCT_FR      (1<<22)
+
+/* Resolve xlink:href inheritance between gradients.
+   Per SVG spec, xlink:href on a gradient inherits ALL unset attributes and stops. */
 static void sigil__resolve_gradient_hrefs(SigilGradientArray *arr) {
-    for (int i = 0; i < arr->count; i++) {
-        SigilGradientDef *g = &arr->data[i];
-        if (g->href[0] == '\0') continue;
-        /* Find referenced gradient */
-        const char *ref = g->href;
-        if (ref[0] == '#') ref++;
-        for (int j = 0; j < arr->count; j++) {
-            if (i == j) continue;
-            if (strcmp(arr->data[j].id, ref) == 0) {
-                /* Inherit stops if none defined */
-                if (g->stop_count == 0 && arr->data[j].stop_count > 0) {
-                    g->stop_count = arr->data[j].stop_count;
-                    g->stops = (SigilGradientStop *)malloc((size_t)g->stop_count * sizeof(SigilGradientStop));
-                    memcpy(g->stops, arr->data[j].stops, (size_t)g->stop_count * sizeof(SigilGradientStop));
+    /* Multiple passes to handle chains (A href B href C) */
+    for (int pass = 0; pass < 4; pass++) {
+        int changed = 0;
+        for (int i = 0; i < arr->count; i++) {
+            SigilGradientDef *g = &arr->data[i];
+            if (g->href[0] == '\0') continue;
+            const char *ref = g->href;
+            if (ref[0] == '#') ref++;
+            for (int j = 0; j < arr->count; j++) {
+                if (i == j) continue;
+                if (strcmp(arr->data[j].id, ref) == 0) {
+                    SigilGradientDef *src = &arr->data[j];
+                    /* Inherit stops if none defined */
+                    if (g->stop_count == 0 && src->stop_count > 0) {
+                        g->stop_count = src->stop_count;
+                        g->stops = (SigilGradientStop *)malloc((size_t)g->stop_count * sizeof(SigilGradientStop));
+                        memcpy(g->stops, src->stops, (size_t)g->stop_count * sizeof(SigilGradientStop));
+                        changed = 1;
+                    }
+                    /* Inherit attributes that weren't explicitly set */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_UNITS) && (src->attrs_set & SIGIL_GRAD_HAS_UNITS)) {
+                        g->objectBBox = src->objectBBox;
+                        g->attrs_set |= SIGIL_GRAD_HAS_UNITS;
+                        changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_SPREAD) && (src->attrs_set & SIGIL_GRAD_HAS_SPREAD)) {
+                        g->spread = src->spread;
+                        g->attrs_set |= SIGIL_GRAD_HAS_SPREAD;
+                        changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_XFORM) && (src->attrs_set & SIGIL_GRAD_HAS_XFORM)) {
+                        memcpy(g->transform, src->transform, sizeof(float)*6);
+                        g->attrs_set |= SIGIL_GRAD_HAS_XFORM;
+                        changed = 1;
+                    }
+                    /* Linear gradient attributes */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_X1) && (src->attrs_set & SIGIL_GRAD_HAS_X1)) {
+                        g->x1 = src->x1; g->attrs_set |= SIGIL_GRAD_HAS_X1; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_Y1) && (src->attrs_set & SIGIL_GRAD_HAS_Y1)) {
+                        g->y1 = src->y1; g->attrs_set |= SIGIL_GRAD_HAS_Y1; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_X2) && (src->attrs_set & SIGIL_GRAD_HAS_X2)) {
+                        g->x2 = src->x2; g->attrs_set |= SIGIL_GRAD_HAS_X2; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_Y2) && (src->attrs_set & SIGIL_GRAD_HAS_Y2)) {
+                        g->y2 = src->y2; g->attrs_set |= SIGIL_GRAD_HAS_Y2; changed = 1;
+                    }
+                    /* Radial gradient attributes */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_CX) && (src->attrs_set & SIGIL_GRAD_HAS_CX)) {
+                        g->cx = src->cx; g->attrs_set |= SIGIL_GRAD_HAS_CX; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_CY) && (src->attrs_set & SIGIL_GRAD_HAS_CY)) {
+                        g->cy = src->cy; g->attrs_set |= SIGIL_GRAD_HAS_CY; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_R) && (src->attrs_set & SIGIL_GRAD_HAS_R)) {
+                        g->r = src->r; g->attrs_set |= SIGIL_GRAD_HAS_R; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_FX) && (src->attrs_set & SIGIL_GRAD_HAS_FX)) {
+                        g->fx = src->fx; g->attrs_set |= SIGIL_GRAD_HAS_FX; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_FY) && (src->attrs_set & SIGIL_GRAD_HAS_FY)) {
+                        g->fy = src->fy; g->attrs_set |= SIGIL_GRAD_HAS_FY; changed = 1;
+                    }
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_FR) && (src->attrs_set & SIGIL_GRAD_HAS_FR)) {
+                        g->fr = src->fr; g->attrs_set |= SIGIL_GRAD_HAS_FR; changed = 1;
+                    }
+                    break;
                 }
-                break;
             }
         }
+        if (!changed) break;
     }
 }
 
@@ -238,6 +324,9 @@ struct SigilScene {
     float         viewBox[4]; /* x, y, w, h */
     bool          has_viewBox;
     float         width, height; /* from <svg> attributes */
+    int           par_align;      /* 1-9: xMin/Mid/MaxYMin/Mid/Max, default 5 (xMidYMid) */
+    int           par_meet_or_slice; /* 0=meet (default), 1=slice */
+    int           par_none;       /* 1 if preserveAspectRatio="none" */
     stbtt_fontinfo *fonts;
     char          **font_names;
     int             font_count;
@@ -310,6 +399,9 @@ struct SigilGPUScene {
     uint32_t gradientCount;
     float    viewBox[4];           /* x, y, w, h -- copied from SigilScene */
     bool     hasViewBox;
+    int      par_align;
+    int      par_meet_or_slice;
+    int      par_none;
 
     /* CPU-side copies for CPU prepare path (compute shader fallback) */
     uint32_t *cpuElemData;         /* 22 u32/f32 per element */
@@ -966,6 +1058,12 @@ static float sigil__get_prop_float(const char *attrs, int attrs_len,
     return sigil__parse_length(val, vlen, 16.0f);
 }
 
+/* Global viewport dimensions for CSS viewport-relative units.
+   Set by the parser when processing the root <svg> element. */
+static float sigil__vp_width_global = 300.0f;
+static float sigil__vp_height_global = 150.0f;
+static float sigil__font_size_global = 16.0f; /* root font size for rem/em */
+
 /* Parse a CSS length value with optional unit suffix.
    ref_size is used for em/% (default font-size or viewport dimension).
    DPI assumption: 96 (CSS reference pixel). */
@@ -975,18 +1073,44 @@ static float sigil__parse_length(const char *val, int vlen, float ref_size) {
     float v = strtof(val, &end);
     int remaining = vlen - (int)(end - val);
     while (remaining > 0 && isspace((unsigned char)*end)) { end++; remaining--; }
-    if (remaining >= 2) {
-        if (end[0]=='p' && end[1]=='x') return v;
-        if (end[0]=='p' && end[1]=='t') return v * (96.0f / 72.0f);
-        if (end[0]=='p' && end[1]=='c') return v * 16.0f;
-        if (end[0]=='m' && end[1]=='m') return v * (96.0f / 25.4f);
-        if (end[0]=='c' && end[1]=='m') return v * (96.0f / 2.54f);
-        if (end[0]=='i' && end[1]=='n') return v * 96.0f;
-        if (end[0]=='e' && end[1]=='m') return v * ref_size;
+    /* Helper: check no trailing alpha after N-char unit (e.g., "mmx" is invalid) */
+    #define SIGIL_UNIT_OK(n) (remaining == (n) || !isalpha((unsigned char)end[n]))
+    if (remaining >= 4) {
+        if (end[0]=='v' && end[1]=='m' && end[2]=='i' && end[3]=='n' && SIGIL_UNIT_OK(4))
+            return v * fminf(sigil__vp_width_global, sigil__vp_height_global) / 100.0f;
+        if (end[0]=='v' && end[1]=='m' && end[2]=='a' && end[3]=='x' && SIGIL_UNIT_OK(4))
+            return v * fmaxf(sigil__vp_width_global, sigil__vp_height_global) / 100.0f;
     }
-    if (remaining >= 3 && end[0]=='r' && end[1]=='e' && end[2]=='m')
-        return v * 16.0f; /* rem = root em, assume 16px */
-    if (remaining >= 1 && end[0] == '%') return v * ref_size / 100.0f;
+    if (remaining >= 3) {
+        if (end[0]=='r' && end[1]=='e' && end[2]=='m' && SIGIL_UNIT_OK(3))
+            return v * sigil__font_size_global;
+        if (end[0]=='r' && end[1]=='l' && end[2]=='h' && SIGIL_UNIT_OK(3))
+            return v * sigil__font_size_global * 1.2f; /* rlh = root line-height, ~1.2em */
+    }
+    if (remaining >= 2) {
+        if (end[0]=='p' && end[1]=='x' && SIGIL_UNIT_OK(2)) return v;
+        if (end[0]=='p' && end[1]=='t' && SIGIL_UNIT_OK(2)) return v * (96.0f / 72.0f);
+        if (end[0]=='p' && end[1]=='c' && SIGIL_UNIT_OK(2)) return v * 16.0f;
+        if (end[0]=='m' && end[1]=='m' && SIGIL_UNIT_OK(2)) return v * (96.0f / 25.4f);
+        if (end[0]=='c' && end[1]=='m' && SIGIL_UNIT_OK(2)) return v * (96.0f / 2.54f);
+        if (end[0]=='i' && end[1]=='n' && SIGIL_UNIT_OK(2)) return v * 96.0f;
+        if (end[0]=='e' && end[1]=='m' && SIGIL_UNIT_OK(2)) return v * ref_size;
+        if (end[0]=='e' && end[1]=='x' && SIGIL_UNIT_OK(2)) return v * ref_size * 0.5f;
+        if (end[0]=='c' && end[1]=='h' && SIGIL_UNIT_OK(2)) return v * ref_size * 0.5f;
+        if (end[0]=='i' && end[1]=='c' && SIGIL_UNIT_OK(2)) return v * ref_size;
+        if (end[0]=='l' && end[1]=='h' && SIGIL_UNIT_OK(2)) return v * ref_size * 1.2f;
+        if (end[0]=='v' && end[1]=='w' && SIGIL_UNIT_OK(2)) return v * sigil__vp_width_global / 100.0f;
+        if (end[0]=='v' && end[1]=='h' && SIGIL_UNIT_OK(2)) return v * sigil__vp_height_global / 100.0f;
+        if (end[0]=='v' && end[1]=='i' && SIGIL_UNIT_OK(2)) return v * sigil__vp_width_global / 100.0f;
+        if (end[0]=='v' && end[1]=='b' && SIGIL_UNIT_OK(2)) return v * sigil__vp_height_global / 100.0f;
+    }
+    if (remaining >= 1) {
+        if (end[0] == '%') return v * ref_size / 100.0f;
+        if (end[0] == 'q' && SIGIL_UNIT_OK(1)) return v * (96.0f / 101.6f); /* 1q = 1/4 mm */
+        /* Unknown unit suffix — treat as invalid (return 0) */
+        if (isalpha((unsigned char)end[0])) return 0.0f;
+    }
+    #undef SIGIL_UNIT_OK
     return v; /* unitless = user units (px) */
 }
 
@@ -998,12 +1122,28 @@ static float sigil__get_attr_float(const char *attrs, int attrs_len,
     return sigil__parse_length(val, vlen, 16.0f);
 }
 
-/* Viewport-aware variant: ref_size = viewport dimension for % resolution */
+/* Viewport-aware variant: ref_size = viewport dimension for % resolution.
+   For em/ex units, parse_length uses the global font_size. The ref_size here
+   is used for % resolution. */
 static float sigil__get_attr_vp(const char *attrs, int alen,
                                  const char *name, float def, float vp_ref) {
     const char *val;
     int vlen = sigil__get_attr(attrs, alen, name, &val);
     if (vlen == 0 || !val) return def;
+    /* Check if value contains em/ex/ch/etc — use font_size_global for those */
+    char *ep;
+    float v = strtof(val, &ep);
+    int rem = vlen - (int)(ep - val);
+    while (rem > 0 && isspace((unsigned char)*ep)) { ep++; rem--; }
+    if (rem >= 2 && ((ep[0]=='e' && ep[1]=='m') || (ep[0]=='e' && ep[1]=='x') ||
+                     (ep[0]=='c' && ep[1]=='h') || (ep[0]=='i' && ep[1]=='c') ||
+                     (ep[0]=='l' && ep[1]=='h'))) {
+        return sigil__parse_length(val, vlen, sigil__font_size_global);
+    }
+    if (rem >= 3 && ep[0]=='r' && ep[1]=='l' && ep[2]=='h') {
+        return sigil__parse_length(val, vlen, sigil__font_size_global);
+    }
+    (void)v;
     return sigil__parse_length(val, vlen, vp_ref);
 }
 
@@ -1209,13 +1349,16 @@ static int sigil__parse_color(const char *str, int len, float out[4]) {
         if (sigil__scan_color_num(&p, end, &rv, &rp) &&
             sigil__scan_color_num(&p, end, &gv, &gp) &&
             sigil__scan_color_num(&p, end, &bv, &bp)) {
+            /* SVG 1.1: rgb values must be all integers or all percentages.
+               Mixed int/percent is invalid. Also, percentage alpha is not supported. */
+            if (rp != gp || gp != bp) return 0; /* mixed int/percent = invalid */
             if (rp) { rv = rv * 255.0f / 100.0f; gv = gv * 255.0f / 100.0f; bv = bv * 255.0f / 100.0f; }
             out[0] = (rv < 0 ? 0 : (rv > 255 ? 255 : rv)) / 255.0f;
             out[1] = (gv < 0 ? 0 : (gv > 255 ? 255 : gv)) / 255.0f;
             out[2] = (bv < 0 ? 0 : (bv > 255 ? 255 : bv)) / 255.0f;
             /* Optional alpha */
             if (sigil__scan_color_num(&p, end, &av, &ap)) {
-                if (ap) av /= 100.0f;
+                if (ap) return 0; /* percentage alpha = invalid in SVG context */
                 out[3] = av < 0 ? 0 : (av > 1 ? 1 : av);
             }
             return 1;
@@ -1403,26 +1546,6 @@ static void sigil__parse_transform(const char *str, int len, float out[6]) {
 /*  Primitive -> curve converters                                     */
 /* ------------------------------------------------------------------ */
 
-static int sigil__rect_to_curves(float x, float y, float w, float h,
-                                  float rx, float ry,
-                                  SigilCurve **out, SigilBounds *bounds) {
-    (void)rx; (void)ry; /* TODO: rounded corners */
-    SigilCurveArray arr;
-    sigil__curve_array_init(&arr);
-
-    /* 4 sides: top, right, bottom, left */
-    sigil__curve_array_push(&arr, sigil__line_to_quad(x, y, x + w, y));
-    sigil__curve_array_push(&arr, sigil__line_to_quad(x + w, y, x + w, y + h));
-    sigil__curve_array_push(&arr, sigil__line_to_quad(x + w, y + h, x, y + h));
-    sigil__curve_array_push(&arr, sigil__line_to_quad(x, y + h, x, y));
-
-    bounds->xMin = x; bounds->yMin = y;
-    bounds->xMax = x + w; bounds->yMax = y + h;
-
-    *out = arr.data;
-    return arr.count;
-}
-
 /* Approximate a quarter of a circle/ellipse using a cubic bezier.
    Uses the standard kappa = 4*(sqrt(2)-1)/3 ≈ 0.5522847498 */
 static void sigil__quarter_ellipse(float cx, float cy,
@@ -1435,6 +1558,47 @@ static void sigil__quarter_ellipse(float cx, float cy,
     float sx = cx + ax, sy = cy + ay;
     float ex = cx + bx, ey = cy + by;
     sigil__cubic_to_quads(sx, sy, c1x, c1y, c2x, c2y, ex, ey, arr);
+}
+
+static int sigil__rect_to_curves(float x, float y, float w, float h,
+                                  float rx, float ry,
+                                  SigilCurve **out, SigilBounds *bounds) {
+    SigilCurveArray arr;
+    sigil__curve_array_init(&arr);
+
+    if (rx <= 0 && ry <= 0) {
+        /* Sharp corners */
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x, y, x + w, y));
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x + w, y, x + w, y + h));
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x + w, y + h, x, y + h));
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x, y + h, x, y));
+    } else {
+        /* Rounded corners using quarter-ellipse arcs.
+           Path: top-left corner -> top edge -> top-right corner -> right edge ->
+                 bottom-right corner -> bottom edge -> bottom-left corner -> left edge */
+        /* Top edge: from (x+rx, y) to (x+w-rx, y) */
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x + rx, y, x + w - rx, y));
+        /* Top-right corner */
+        sigil__quarter_ellipse(x + w - rx, y + ry, 0, -ry, rx, 0, &arr);
+        /* Right edge */
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x + w, y + ry, x + w, y + h - ry));
+        /* Bottom-right corner */
+        sigil__quarter_ellipse(x + w - rx, y + h - ry, rx, 0, 0, ry, &arr);
+        /* Bottom edge */
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x + w - rx, y + h, x + rx, y + h));
+        /* Bottom-left corner */
+        sigil__quarter_ellipse(x + rx, y + h - ry, 0, ry, -rx, 0, &arr);
+        /* Left edge */
+        sigil__curve_array_push(&arr, sigil__line_to_quad(x, y + h - ry, x, y + ry));
+        /* Top-left corner */
+        sigil__quarter_ellipse(x + rx, y + ry, -rx, 0, 0, -ry, &arr);
+    }
+
+    bounds->xMin = x; bounds->yMin = y;
+    bounds->xMax = x + w; bounds->yMax = y + h;
+
+    *out = arr.data;
+    return arr.count;
 }
 
 static int sigil__circle_to_curves(float cx, float cy, float r,
@@ -1706,8 +1870,9 @@ static void sigil__join_miter(SigilCurveArray *arr,
     }
 
     /* Miter limit check: miter_ratio = 1/sin(theta/2),
-       sin^2(theta/2) = (1 - dot_n)/2 */
-    float sin2_half = (1.0f - dot_n) * 0.5f;
+       theta = angle between path segments at join.
+       cos(theta) = -dot(n0,n1), so sin^2(theta/2) = (1 + dot_n)/2 */
+    float sin2_half = (1.0f + dot_n) * 0.5f;
     float limit_sq = mlimit * mlimit;
     if (sin2_half > 1e-10f && (1.0f / sin2_half) > limit_sq) {
         sigil__join_bevel(arr, o0x, o0y, o1x, o1y);
@@ -1895,6 +2060,142 @@ static void sigil__inner_join(SigilCurveArray *arr,
 }
 
 /* ================================================================== */
+
+/* Apply stroke dash array to a set of curves.
+   Input: original curves, dash_array (alternating dash/gap lengths), dash_offset.
+   Output: new set of curves representing only the dashed segments.
+   Each dash becomes a separate sub-path. */
+static int sigil__apply_dash(SigilCurve *curves, int count,
+                              const float *dash_array, int dash_count,
+                              float dash_offset,
+                              SigilCurve **out, SigilBounds *bounds) {
+    if (count == 0 || dash_count == 0) {
+        *out = NULL;
+        bounds->xMin = bounds->yMin = bounds->xMax = bounds->yMax = 0;
+        return 0;
+    }
+
+    /* Flatten curves into polylines per subpath, then walk with dash pattern */
+    SigilCurveArray result;
+    sigil__curve_array_init(&result);
+
+    /* Detect subpath boundaries */
+    int *sp_starts = (int *)malloc((size_t)(count + 1) * sizeof(int));
+    int num_sp = 0;
+    sp_starts[num_sp++] = 0;
+    for (int i = 1; i < count; i++) {
+        float dx = curves[i].p0x - curves[i-1].p2x;
+        float dy = curves[i].p0y - curves[i-1].p2y;
+        if (dx*dx + dy*dy > 1e-6f)
+            sp_starts[num_sp++] = i;
+    }
+    sp_starts[num_sp] = count;
+
+    /* Compute total dash pattern length */
+    float dash_total = 0;
+    for (int i = 0; i < dash_count; i++) dash_total += dash_array[i];
+    if (dash_total <= 0) { free(sp_starts); *out = NULL; return 0; }
+
+    for (int sp = 0; sp < num_sp; sp++) {
+        int sp_begin = sp_starts[sp];
+        int sp_end = sp_starts[sp + 1];
+
+        /* Flatten subpath */
+        float *pts = NULL;
+        int npts = 0, ptcap = 0;
+        sigil__pts_push(&pts, &npts, &ptcap, curves[sp_begin].p0x, curves[sp_begin].p0y);
+        for (int i = sp_begin; i < sp_end; i++)
+            sigil__flatten_quad(curves[i].p0x, curves[i].p0y,
+                                curves[i].p1x, curves[i].p1y,
+                                curves[i].p2x, curves[i].p2y,
+                                &pts, &npts, &ptcap);
+
+        if (npts < 2) { free(pts); continue; }
+
+        /* Walk along polyline applying dash pattern */
+        float phase = fmodf(dash_offset, dash_total);
+        if (phase < 0) phase += dash_total;
+        /* Find initial position in dash pattern */
+        int dash_idx = 0;
+        float dash_remaining = dash_array[0];
+        while (phase > 0 && dash_count > 0) {
+            if (phase < dash_remaining) {
+                dash_remaining -= phase;
+                phase = 0;
+            } else {
+                phase -= dash_remaining;
+                dash_idx = (dash_idx + 1) % dash_count;
+                dash_remaining = dash_array[dash_idx];
+            }
+        }
+        int is_drawing = (dash_idx % 2 == 0); /* even=dash, odd=gap */
+
+        float prev_x = pts[0], prev_y = pts[1];
+        float seg_start_x = prev_x, seg_start_y = prev_y;
+
+        for (int i = 1; i < npts; i++) {
+            float nx = pts[i*2], ny = pts[i*2+1];
+            float dx = nx - prev_x, dy = ny - prev_y;
+            float seg_len = sqrtf(dx*dx + dy*dy);
+            if (seg_len < 1e-8f) { prev_x = nx; prev_y = ny; continue; }
+
+            float consumed = 0;
+            while (consumed < seg_len - 1e-8f) {
+                float remain_in_seg = seg_len - consumed;
+                float advance = fminf(remain_in_seg, dash_remaining);
+                float t = (consumed + advance) / seg_len;
+                float ex = prev_x + t * dx - prev_x * 0 + prev_x;
+                /* Interpolate point on segment */
+                float px = prev_x + (consumed + advance) / seg_len * dx;
+                float py = prev_y + (consumed + advance) / seg_len * dy;
+
+                if (is_drawing) {
+                    sigil__curve_array_push(&result, sigil__line_to_quad(
+                        seg_start_x, seg_start_y, px, py));
+                }
+
+                consumed += advance;
+                dash_remaining -= advance;
+
+                if (dash_remaining <= 1e-8f) {
+                    dash_idx = (dash_idx + 1) % dash_count;
+                    dash_remaining = dash_array[dash_idx];
+                    is_drawing = (dash_idx % 2 == 0);
+                    seg_start_x = px;
+                    seg_start_y = py;
+                }
+            }
+
+            prev_x = nx;
+            prev_y = ny;
+        }
+
+        free(pts);
+    }
+
+    free(sp_starts);
+
+    /* Compute bounds */
+    bounds->xMin = FLT_MAX; bounds->yMin = FLT_MAX;
+    bounds->xMax = -FLT_MAX; bounds->yMax = -FLT_MAX;
+    for (int i = 0; i < result.count; i++) {
+        float xs[3] = { result.data[i].p0x, result.data[i].p1x, result.data[i].p2x };
+        float ys[3] = { result.data[i].p0y, result.data[i].p1y, result.data[i].p2y };
+        for (int j = 0; j < 3; j++) {
+            if (xs[j] < bounds->xMin) bounds->xMin = xs[j];
+            if (xs[j] > bounds->xMax) bounds->xMax = xs[j];
+            if (ys[j] < bounds->yMin) bounds->yMin = ys[j];
+            if (ys[j] > bounds->yMax) bounds->yMax = ys[j];
+        }
+    }
+    if (result.count == 0) {
+        bounds->xMin = bounds->yMin = 0;
+        bounds->xMax = bounds->yMax = 0;
+    }
+
+    *out = result.data;
+    return result.count;
+}
 
 static int sigil__stroke_to_fill(SigilCurve *curves, int count,
                                   float stroke_width,
@@ -2443,18 +2744,35 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
     const char *g_style_stack[32] = {NULL};
     int g_style_len_stack[32] = {0};
 
+    /* Use-redirect return stack: when <use> references a container,
+       we redirect pos into the container. After the closing tag,
+       we restore pos from this stack. Also track target IDs for cycle detection. */
+    int use_return_pos[8];
+    int use_return_depth[8];
+    const char *use_return_id[8];
+    int use_return_id_len[8];
+    int use_return_n = 0;
+
     int pos = 0;
     SigilTag tag;
 
     while (sigil__next_tag(svg_data, (int)len, &pos, &tag)) {
         if (tag.is_close) {
             /* Closing tag */
-            if (sigil__tag_is(&tag, "g")) {
+            if (sigil__tag_is(&tag, "g") || sigil__tag_is(&tag, "svg") || sigil__tag_is(&tag, "symbol")) {
                 if (xform_depth > 0) xform_depth--;
+                /* Check if this closes a use-redirect container — return to after the <use> */
+                if (use_return_n > 0 && xform_depth < use_return_depth[use_return_n - 1]) {
+                    use_return_n--;
+                    pos = use_return_pos[use_return_n];
+                }
             }
             else if (sigil__tag_is(&tag, "defs")) { in_defs = 0; }
             else if (sigil__tag_is(&tag, "linearGradient") ||
-                     sigil__tag_is(&tag, "radialGradient")) { in_gradient = 0; }
+                     sigil__tag_is(&tag, "radialGradient")) {
+                in_gradient = 0;
+                if (xform_depth > 0) xform_depth--; /* pop gradient style frame */
+            }
             continue;
         }
 
@@ -2464,15 +2782,36 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             continue;
         }
 
+        /* <symbol> — like <defs>, content is not rendered directly.
+           It's only instantiated when referenced by <use>. */
+        if (sigil__tag_is(&tag, "symbol")) {
+            if (!tag.self_close) {
+                /* Skip until </symbol> */
+                int sym_depth = 1;
+                SigilTag skip_tag;
+                while (sym_depth > 0 && sigil__next_tag(svg_data, (int)len, &pos, &skip_tag)) {
+                    if (sigil__tag_is(&skip_tag, "symbol")) {
+                        if (skip_tag.is_close) sym_depth--;
+                        else if (!skip_tag.self_close) sym_depth++;
+                    }
+                    /* But still parse gradients inside symbol for potential url() references */
+                    if (!skip_tag.is_close && (sigil__tag_is(&skip_tag, "linearGradient") || sigil__tag_is(&skip_tag, "radialGradient"))) {
+                        /* Re-inject gradient parsing would be complex; for now, gradients inside symbols
+                           must be in <defs> to be found. */
+                    }
+                }
+            }
+            continue;
+        }
+
         /* <linearGradient> and <radialGradient> (can appear inside or outside <defs>) */
         if (sigil__tag_is(&tag, "linearGradient")) {
             SigilGradientDef *g = sigil__grad_array_push(&grad_defs);
             g->type = 1;
-            /* Extract id */
+            g->attrs_set = 0;
             const char *id_val;
             int id_len = sigil__get_attr(tag.attrs, tag.attrs_len, "id", &id_val);
             if (id_len > 0 && id_len < 127) { memcpy(g->id, id_val, (size_t)id_len); g->id[id_len] = '\0'; }
-            /* Extract xlink:href */
             const char *href_val;
             int href_len = sigil__get_attr(tag.attrs, tag.attrs_len, "xlink:href", &href_val);
             if (href_len == 0) href_len = sigil__get_attr(tag.attrs, tag.attrs_len, "href", &href_val);
@@ -2480,34 +2819,41 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             /* gradientUnits */
             const char *gu;
             int gulen = sigil__get_attr(tag.attrs, tag.attrs_len, "gradientUnits", &gu);
-            if (gulen > 0 && gulen == 16 && memcmp(gu, "userSpaceOnUse", 14) == 0) g->objectBBox = 0;
+            if (gulen > 0) {
+                g->attrs_set |= SIGIL_GRAD_HAS_UNITS;
+                if (gulen >= 14 && memcmp(gu, "userSpaceOnUse", 14) == 0) g->objectBBox = 0;
+            }
             /* spreadMethod */
             const char *sm;
             int smlen = sigil__get_attr(tag.attrs, tag.attrs_len, "spreadMethod", &sm);
-            if (smlen == 7 && memcmp(sm, "reflect", 7) == 0) g->spread = 1;
-            else if (smlen == 6 && memcmp(sm, "repeat", 6) == 0) g->spread = 2;
-            /* Endpoint attributes */
-            g->x1 = sigil__get_attr_float(tag.attrs, tag.attrs_len, "x1", g->objectBBox ? 0.0f : 0.0f);
-            g->y1 = sigil__get_attr_float(tag.attrs, tag.attrs_len, "y1", 0.0f);
-            g->x2 = sigil__get_attr_float(tag.attrs, tag.attrs_len, "x2", g->objectBBox ? 1.0f : 0.0f);
-            g->y2 = sigil__get_attr_float(tag.attrs, tag.attrs_len, "y2", 0.0f);
-            /* Handle percentage values for objectBoundingBox */
-            if (g->objectBBox) {
-                const char *v; int vl;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "x1", &v);
-                if (vl > 0 && v[vl-1] == '%') g->x1 = strtof(v, NULL) / 100.0f;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "y1", &v);
-                if (vl > 0 && v[vl-1] == '%') g->y1 = strtof(v, NULL) / 100.0f;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "x2", &v);
-                if (vl > 0 && v[vl-1] == '%') g->x2 = strtof(v, NULL) / 100.0f;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "y2", &v);
-                if (vl > 0 && v[vl-1] == '%') g->y2 = strtof(v, NULL) / 100.0f;
+            if (smlen > 0) {
+                g->attrs_set |= SIGIL_GRAD_HAS_SPREAD;
+                if (smlen == 7 && memcmp(sm, "reflect", 7) == 0) g->spread = 1;
+                else if (smlen == 6 && memcmp(sm, "repeat", 6) == 0) g->spread = 2;
+            }
+            /* Endpoint attributes — track which are explicitly set, and whether % was used */
+            { const char *v; int vl;
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "x1", &v);
+              if (vl > 0) { g->x1 = strtof(v, NULL); if (v[vl-1]=='%') { g->x1/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_X1; } g->attrs_set |= SIGIL_GRAD_HAS_X1; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "y1", &v);
+              if (vl > 0) { g->y1 = strtof(v, NULL); if (v[vl-1]=='%') { g->y1/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_Y1; } g->attrs_set |= SIGIL_GRAD_HAS_Y1; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "x2", &v);
+              if (vl > 0) { g->x2 = strtof(v, NULL); if (v[vl-1]=='%') { g->x2/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_X2; } g->attrs_set |= SIGIL_GRAD_HAS_X2; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "y2", &v);
+              if (vl > 0) { g->y2 = strtof(v, NULL); if (v[vl-1]=='%') { g->y2/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_Y2; } g->attrs_set |= SIGIL_GRAD_HAS_Y2; }
             }
             /* gradientTransform */
             const char *gt;
             int gtlen = sigil__get_attr(tag.attrs, tag.attrs_len, "gradientTransform", &gt);
-            if (gtlen > 0) sigil__parse_transform(gt, gtlen, g->transform);
-            in_gradient = grad_defs.count; /* 1-based index */
+            if (gtlen > 0) { sigil__parse_transform(gt, gtlen, g->transform); g->attrs_set |= SIGIL_GRAD_HAS_XFORM; }
+            in_gradient = grad_defs.count;
+            /* Push gradient attrs so child <stop> elements can inherit "color" */
+            if (!tag.self_close && xform_depth < 31) {
+                xform_depth++;
+                sigil__mat_identity(xform_stack[xform_depth]);
+                g_style_stack[xform_depth] = tag.attrs;
+                g_style_len_stack[xform_depth] = tag.attrs_len;
+            }
             if (tag.self_close) in_gradient = 0;
             continue;
         }
@@ -2515,6 +2861,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         if (sigil__tag_is(&tag, "radialGradient")) {
             SigilGradientDef *g = sigil__grad_array_push(&grad_defs);
             g->type = 2;
+            g->attrs_set = 0;
             const char *id_val;
             int id_len = sigil__get_attr(tag.attrs, tag.attrs_len, "id", &id_val);
             if (id_len > 0 && id_len < 127) { memcpy(g->id, id_val, (size_t)id_len); g->id[id_len] = '\0'; }
@@ -2524,33 +2871,45 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             if (href_len > 0 && href_len < 127) { memcpy(g->href, href_val, (size_t)href_len); g->href[href_len] = '\0'; }
             const char *gu;
             int gulen = sigil__get_attr(tag.attrs, tag.attrs_len, "gradientUnits", &gu);
-            if (gulen > 0 && gulen >= 14 && memcmp(gu, "userSpaceOnUse", 14) == 0) g->objectBBox = 0;
+            if (gulen > 0) {
+                g->attrs_set |= SIGIL_GRAD_HAS_UNITS;
+                if (gulen >= 14 && memcmp(gu, "userSpaceOnUse", 14) == 0) g->objectBBox = 0;
+            }
             const char *sm;
             int smlen = sigil__get_attr(tag.attrs, tag.attrs_len, "spreadMethod", &sm);
-            if (smlen == 7 && memcmp(sm, "reflect", 7) == 0) g->spread = 1;
-            else if (smlen == 6 && memcmp(sm, "repeat", 6) == 0) g->spread = 2;
-            g->cx = sigil__get_attr_float(tag.attrs, tag.attrs_len, "cx", 0.5f);
-            g->cy = sigil__get_attr_float(tag.attrs, tag.attrs_len, "cy", 0.5f);
-            g->r  = sigil__get_attr_float(tag.attrs, tag.attrs_len, "r", 0.5f);
-            g->fx = sigil__get_attr_float(tag.attrs, tag.attrs_len, "fx", -1.0f);
-            g->fy = sigil__get_attr_float(tag.attrs, tag.attrs_len, "fy", -1.0f);
-            g->fr = sigil__get_attr_float(tag.attrs, tag.attrs_len, "fr", 0.0f);
-            if (g->objectBBox) {
-                const char *v; int vl;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "cx", &v);
-                if (vl > 0 && v[vl-1] == '%') g->cx = strtof(v, NULL) / 100.0f;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "cy", &v);
-                if (vl > 0 && v[vl-1] == '%') g->cy = strtof(v, NULL) / 100.0f;
-                vl = sigil__get_attr(tag.attrs, tag.attrs_len, "r", &v);
-                if (vl > 0 && v[vl-1] == '%') g->r = strtof(v, NULL) / 100.0f;
+            if (smlen > 0) {
+                g->attrs_set |= SIGIL_GRAD_HAS_SPREAD;
+                if (smlen == 7 && memcmp(sm, "reflect", 7) == 0) g->spread = 1;
+                else if (smlen == 6 && memcmp(sm, "repeat", 6) == 0) g->spread = 2;
             }
-            /* focal defaults to center */
-            if (g->fx < -0.5f) g->fx = g->cx;
-            if (g->fy < -0.5f) g->fy = g->cy;
+            /* Radial attributes — track which are explicitly set, and whether % was used */
+            { const char *v; int vl;
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "cx", &v);
+              if (vl > 0) { g->cx = strtof(v, NULL); if (v[vl-1]=='%') { g->cx/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_CX; } g->attrs_set |= SIGIL_GRAD_HAS_CX; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "cy", &v);
+              if (vl > 0) { g->cy = strtof(v, NULL); if (v[vl-1]=='%') { g->cy/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_CY; } g->attrs_set |= SIGIL_GRAD_HAS_CY; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "r", &v);
+              if (vl > 0) { g->r = strtof(v, NULL); if (v[vl-1]=='%') { g->r/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_R; } g->attrs_set |= SIGIL_GRAD_HAS_R; }
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "fx", &v);
+              if (vl > 0) { g->fx = strtof(v, NULL); if (v[vl-1]=='%') { g->fx/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_FX; } g->attrs_set |= SIGIL_GRAD_HAS_FX; }
+              else g->fx = -1.0f; /* sentinel */
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "fy", &v);
+              if (vl > 0) { g->fy = strtof(v, NULL); if (v[vl-1]=='%') { g->fy/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_FY; } g->attrs_set |= SIGIL_GRAD_HAS_FY; }
+              else g->fy = -1.0f;
+              vl = sigil__get_attr(tag.attrs, tag.attrs_len, "fr", &v);
+              if (vl > 0) { g->fr = strtof(v, NULL); if (v[vl-1]=='%') { g->fr/=100.0f; g->attrs_set |= SIGIL_GRAD_PCT_FR; } g->attrs_set |= SIGIL_GRAD_HAS_FR; }
+            }
+            /* focal defaults to center (done after href resolution) */
             const char *gt;
             int gtlen = sigil__get_attr(tag.attrs, tag.attrs_len, "gradientTransform", &gt);
-            if (gtlen > 0) sigil__parse_transform(gt, gtlen, g->transform);
+            if (gtlen > 0) { sigil__parse_transform(gt, gtlen, g->transform); g->attrs_set |= SIGIL_GRAD_HAS_XFORM; }
             in_gradient = grad_defs.count;
+            if (!tag.self_close && xform_depth < 31) {
+                xform_depth++;
+                sigil__mat_identity(xform_stack[xform_depth]);
+                g_style_stack[xform_depth] = tag.attrs;
+                g_style_len_stack[xform_depth] = tag.attrs_len;
+            }
             if (tag.self_close) in_gradient = 0;
             continue;
         }
@@ -2563,25 +2922,81 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             SigilGradientStop *s = &g->stops[g->stop_count++];
             memset(s, 0, sizeof(*s));
             s->color[3] = 1.0f;
-            /* offset */
+            /* offset — only number or percentage is valid, ignore units like "5mm" */
             const char *off_val;
             int off_len = sigil__get_attr(tag.attrs, tag.attrs_len, "offset", &off_val);
             if (off_len > 0) {
-                s->offset = strtof(off_val, NULL);
-                if (off_val[off_len-1] == '%') s->offset /= 100.0f;
+                char *ep;
+                s->offset = strtof(off_val, &ep);
+                int rem = off_len - (int)(ep - off_val);
+                while (rem > 0 && isspace((unsigned char)*ep)) { ep++; rem--; }
+                if (rem > 0 && *ep == '%') { s->offset /= 100.0f; }
+                else if (rem > 0 && isalpha((unsigned char)*ep)) {
+                    /* Invalid unit (e.g. "5mm") — treat as 0 */
+                    s->offset = 0;
+                }
             }
             if (s->offset < 0) s->offset = 0;
             if (s->offset > 1) s->offset = 1;
+
+            /* Resolve 'color' property on the stop or gradient for currentColor */
+            float stop_current_color[4] = {0, 0, 0, 1};
+            {
+                const char *cv;
+                int cl = sigil__get_attr(tag.attrs, tag.attrs_len, "color", &cv);
+                if (cl > 0) {
+                    sigil__parse_color(cv, cl, stop_current_color);
+                } else {
+                    /* Check style for color */
+                    const char *ss;
+                    int ssl = sigil__get_attr(tag.attrs, tag.attrs_len, "style", &ss);
+                    cl = sigil__get_style_prop(ss, ssl, "color", &cv);
+                    if (cl > 0) sigil__parse_color(cv, cl, stop_current_color);
+                }
+                /* Inherit color from parent gradient or groups if not set on stop */
+                if (cl == 0) {
+                    for (int gi = xform_depth; gi >= 0; gi--) {
+                        if (!g_style_stack[gi]) continue;
+                        cl = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "color", &cv);
+                        if (cl > 0) { sigil__parse_color(cv, cl, stop_current_color); break; }
+                    }
+                }
+            }
+
             /* stop-color: check style, then attribute */
             const char *sc_style;
             int sc_slen = sigil__get_attr(tag.attrs, tag.attrs_len, "style", &sc_style);
             const char *sc_val;
             int sc_len = sigil__get_prop(tag.attrs, tag.attrs_len, sc_style, sc_slen, "stop-color", &sc_val);
-            if (sc_len > 0) sigil__parse_color(sc_val, sc_len, s->color);
-            /* stop-opacity */
+            if (sc_len > 0) {
+                int cr = sigil__parse_color(sc_val, sc_len, s->color);
+                if (cr == SIGIL_COLOR_CURRENT) {
+                    memcpy(s->color, stop_current_color, sizeof(float)*4);
+                } else if (cr == SIGIL_COLOR_INHERIT) {
+                    /* inherit: look up stop-color from parent gradient element */
+                    const char *psc;
+                    int pscl = sigil__get_attr(tag.attrs, tag.attrs_len, "stop-color", &psc);
+                    if (pscl == 0) {
+                        /* Check parent gradient's attrs via the in_gradient mechanism.
+                           The gradient is grad_defs.data[in_gradient-1]. We need its tag attrs,
+                           but they're not stored. Fall back to the group style stack. */
+                        for (int gi = xform_depth; gi >= 0; gi--) {
+                            if (!g_style_stack[gi]) continue;
+                            pscl = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stop-color", &psc);
+                            if (pscl > 0) { sigil__parse_color(psc, pscl, s->color); break; }
+                        }
+                    }
+                }
+            }
+            /* stop-opacity: multiply with any alpha from stop-color (e.g. hsla) */
             const char *so_val;
             int so_len = sigil__get_prop(tag.attrs, tag.attrs_len, sc_style, sc_slen, "stop-opacity", &so_val);
-            if (so_len > 0) s->color[3] = strtof(so_val, NULL);
+            if (so_len > 0) {
+                float sop = strtof(so_val, NULL);
+                if (so_len > 0 && so_val[so_len-1] == '%') sop /= 100.0f;
+                if (sop < 0) sop = 0; if (sop > 1) sop = 1;
+                s->color[3] *= sop; /* multiply, don't overwrite */
+            }
             continue;
         }
 
@@ -2590,19 +3005,206 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
 
         /* <svg> tag: extract viewBox, width, height */
         if (sigil__tag_is(&tag, "svg")) {
-            scene->width = sigil__get_attr_float(tag.attrs, tag.attrs_len, "width", 0);
-            scene->height = sigil__get_attr_float(tag.attrs, tag.attrs_len, "height", 0);
+            /* Track whether this is a nested <svg> vs root */
+            int is_root_svg = (scene->width == 0 && scene->height == 0 && !scene->has_viewBox);
 
+            float svg_w = sigil__get_attr_float(tag.attrs, tag.attrs_len, "width", 0);
+            float svg_h = sigil__get_attr_float(tag.attrs, tag.attrs_len, "height", 0);
+
+            float svg_vb[4] = {0, 0, 0, 0};
+            int has_vb = 0;
             const char *vb;
             int vblen = sigil__get_attr(tag.attrs, tag.attrs_len, "viewBox", &vb);
             if (vblen > 0 && vb) {
-                scene->has_viewBox = true;
-                sscanf(vb, "%f %f %f %f",
-                       &scene->viewBox[0], &scene->viewBox[1],
-                       &scene->viewBox[2], &scene->viewBox[3]);
-                /* Use viewBox dimensions if width/height not set */
-                if (scene->width == 0) scene->width = scene->viewBox[2];
-                if (scene->height == 0) scene->height = scene->viewBox[3];
+                has_vb = 1;
+                sscanf(vb, "%f %f %f %f", &svg_vb[0], &svg_vb[1], &svg_vb[2], &svg_vb[3]);
+                if (svg_w == 0) svg_w = svg_vb[2];
+                if (svg_h == 0) svg_h = svg_vb[3];
+            }
+
+            /* Check display:none on the svg element */
+            {
+                const char *dv;
+                int dvlen = sigil__get_attr(tag.attrs, tag.attrs_len, "display", &dv);
+                if (dvlen == 4 && memcmp(dv, "none", 4) == 0) {
+                    /* Still set scene dimensions before skipping */
+                    if (is_root_svg) {
+                        scene->width = svg_w > 0 ? svg_w : 300.0f;
+                        scene->height = svg_h > 0 ? svg_h : 150.0f;
+                        if (has_vb) {
+                            scene->has_viewBox = true;
+                            memcpy(scene->viewBox, svg_vb, sizeof(svg_vb));
+                        }
+                    }
+                    /* Skip until closing </svg> by tracking depth */
+                    int svg_nest = 1;
+                    SigilTag skip_tag;
+                    while (svg_nest > 0 && sigil__next_tag(svg_data, (int)len, &pos, &skip_tag)) {
+                        if (sigil__tag_is(&skip_tag, "svg")) {
+                            if (skip_tag.is_close) svg_nest--;
+                            else if (!skip_tag.self_close) svg_nest++;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            /* Check opacity on the svg element */
+            float svg_opacity = 1.0f;
+            {
+                const char *ov;
+                int ol = sigil__get_attr(tag.attrs, tag.attrs_len, "opacity", &ov);
+                if (ol > 0) {
+                    svg_opacity = strtof(ov, NULL);
+                    if (ol > 0 && ov[ol-1] == '%') svg_opacity /= 100.0f;
+                    if (svg_opacity < 0) svg_opacity = 0;
+                    if (svg_opacity > 1) svg_opacity = 1;
+                }
+            }
+
+            if (is_root_svg) {
+                scene->width = svg_w;
+                scene->height = svg_h;
+                if (has_vb) {
+                    scene->has_viewBox = true;
+                    memcpy(scene->viewBox, svg_vb, sizeof(svg_vb));
+                }
+                /* Set global viewport for CSS units */
+                if (svg_w > 0) sigil__vp_width_global = svg_w;
+                if (svg_h > 0) sigil__vp_height_global = svg_h;
+
+                /* Handle root SVG opacity by adjusting transform stack */
+                if (svg_opacity < 1.0f) {
+                    /* Store opacity in a way child elements can inherit it */
+                    /* We'll handle this via the g_style_stack mechanism */
+                    if (xform_depth < 31) {
+                        xform_depth++;
+                        sigil__mat_identity(xform_stack[xform_depth]);
+                        g_style_stack[xform_depth] = tag.attrs;
+                        g_style_len_stack[xform_depth] = tag.attrs_len;
+                    }
+                }
+
+                /* Handle preserveAspectRatio on root svg */
+                if (has_vb && (svg_vb[2] > 0) && (svg_vb[3] > 0)) {
+                    const char *par;
+                    int par_len = sigil__get_attr(tag.attrs, tag.attrs_len, "preserveAspectRatio", &par);
+                    scene->par_align = 5; /* default: xMidYMid */
+                    scene->par_meet_or_slice = 0;
+                    scene->par_none = 0;
+                    if (par_len > 0 && par) {
+                        if (par_len >= 4 && memcmp(par, "none", 4) == 0) {
+                            scene->par_none = 1;
+                        } else if (par_len >= 8) {
+                            int xalign = 1, yalign = 1;
+                            if (memcmp(par+1, "Min", 3) == 0) xalign = 0;
+                            else if (memcmp(par+1, "Mid", 3) == 0) xalign = 1;
+                            else if (memcmp(par+1, "Max", 3) == 0) xalign = 2;
+                            if (memcmp(par+5, "Min", 3) == 0) yalign = 0;
+                            else if (memcmp(par+5, "Mid", 3) == 0) yalign = 1;
+                            else if (memcmp(par+5, "Max", 3) == 0) yalign = 2;
+                            scene->par_align = yalign * 3 + xalign;
+                            const char *ms = par;
+                            while (ms < par + par_len && *ms != ' ') ms++;
+                            while (ms < par + par_len && *ms == ' ') ms++;
+                            int ms_len = par_len - (int)(ms - par);
+                            if (ms_len >= 5 && memcmp(ms, "slice", 5) == 0) scene->par_meet_or_slice = 1;
+                        }
+                    }
+                }
+            } else {
+                /* Nested <svg>: push a new coordinate system */
+                float nest_x = sigil__get_attr_float(tag.attrs, tag.attrs_len, "x", 0);
+                float nest_y = sigil__get_attr_float(tag.attrs, tag.attrs_len, "y", 0);
+
+                /* Default size: if no width/height, use parent viewport */
+                if (svg_w == 0) svg_w = scene->width > 0 ? scene->width : 300.0f;
+                if (svg_h == 0) svg_h = scene->height > 0 ? scene->height : 150.0f;
+
+                /* Handle percentage width/height relative to parent viewport */
+                {
+                    const char *wv;
+                    int wl = sigil__get_attr(tag.attrs, tag.attrs_len, "width", &wv);
+                    if (wl > 0 && wv[wl-1] == '%') {
+                        float pct = strtof(wv, NULL);
+                        svg_w = pct * (scene->width > 0 ? scene->width : 300.0f) / 100.0f;
+                    }
+                    int hl = sigil__get_attr(tag.attrs, tag.attrs_len, "height", &wv);
+                    if (hl > 0 && wv[hl-1] == '%') {
+                        float pct = strtof(wv, NULL);
+                        svg_h = pct * (scene->height > 0 ? scene->height : 150.0f) / 100.0f;
+                    }
+                }
+
+                /* Build transform: translate(x,y) then viewBox mapping if present */
+                float nested_xform[6] = {1, 0, 0, 1, nest_x, nest_y};
+
+                if (has_vb && svg_vb[2] > 0 && svg_vb[3] > 0) {
+                    /* Parse preserveAspectRatio */
+                    const char *par;
+                    int par_len = sigil__get_attr(tag.attrs, tag.attrs_len, "preserveAspectRatio", &par);
+                    int align = 6; /* default: xMidYMid */
+                    int meet_or_slice = 0; /* 0 = meet (default), 1 = slice */
+                    int par_none = 0;
+
+                    if (par_len > 0 && par) {
+                        if (par_len >= 4 && memcmp(par, "none", 4) == 0) {
+                            par_none = 1;
+                        } else {
+                            /* Parse alignment: xMinYMin=1, xMidYMin=2, xMaxYMin=3,
+                               xMinYMid=4, xMidYMid=5, xMaxYMid=6,
+                               xMinYMax=7, xMidYMax=8, xMaxYMax=9 */
+                            int xalign = 1, yalign = 1; /* 0=Min, 1=Mid, 2=Max */
+                            if (par_len >= 8) {
+                                if (memcmp(par+1, "Min", 3) == 0) xalign = 0;
+                                else if (memcmp(par+1, "Mid", 3) == 0) xalign = 1;
+                                else if (memcmp(par+1, "Max", 3) == 0) xalign = 2;
+                                if (memcmp(par+5, "Min", 3) == 0) yalign = 0;
+                                else if (memcmp(par+5, "Mid", 3) == 0) yalign = 1;
+                                else if (memcmp(par+5, "Max", 3) == 0) yalign = 2;
+                            }
+                            align = yalign * 3 + xalign;
+                            /* Check for "slice" or "meet" */
+                            const char *ms = par;
+                            while (ms < par + par_len && *ms != ' ') ms++;
+                            while (ms < par + par_len && *ms == ' ') ms++;
+                            int ms_len = par_len - (int)(ms - par);
+                            if (ms_len >= 5 && memcmp(ms, "slice", 5) == 0) meet_or_slice = 1;
+                        }
+                    }
+
+                    float sx = svg_w / svg_vb[2];
+                    float sy = svg_h / svg_vb[3];
+                    float tx = -svg_vb[0];
+                    float ty = -svg_vb[1];
+
+                    if (!par_none) {
+                        float s = meet_or_slice ? fmaxf(sx, sy) : fminf(sx, sy);
+                        float dx = svg_w - svg_vb[2] * s;
+                        float dy = svg_h - svg_vb[3] * s;
+                        int xalign = align % 3, yalign = align / 3;
+                        float ox = xalign == 0 ? 0 : (xalign == 1 ? dx * 0.5f : dx);
+                        float oy = yalign == 0 ? 0 : (yalign == 1 ? dy * 0.5f : dy);
+                        /* transform: translate(nest_x+ox, nest_y+oy) scale(s) translate(-vbx, -vby) */
+                        nested_xform[0] = s; nested_xform[1] = 0;
+                        nested_xform[2] = 0; nested_xform[3] = s;
+                        nested_xform[4] = nest_x + ox + tx * s;
+                        nested_xform[5] = nest_y + oy + ty * s;
+                    } else {
+                        nested_xform[0] = sx; nested_xform[1] = 0;
+                        nested_xform[2] = 0;  nested_xform[3] = sy;
+                        nested_xform[4] = nest_x + tx * sx;
+                        nested_xform[5] = nest_y + ty * sy;
+                    }
+                }
+
+                if (xform_depth < 31) {
+                    xform_depth++;
+                    sigil__mat_multiply(xform_stack[xform_depth - 1], nested_xform,
+                                        xform_stack[xform_depth]);
+                    g_style_stack[xform_depth] = tag.attrs;
+                    g_style_len_stack[xform_depth] = tag.attrs_len;
+                }
             }
             continue;
         }
@@ -2631,6 +3233,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
 
         /* Shape elements */
         int is_shape = 0;
+        int use_shape_frame = 0; /* set when <use> resolves to a shape; pop xform after rendering */
         SigilCurve *curves = NULL;
         int curve_count = 0;
         SigilBounds shape_bounds = {0, 0, 0, 0};
@@ -2639,6 +3242,23 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         float vp_w = scene->width > 0 ? scene->width : 200.0f;
         float vp_h = scene->height > 0 ? scene->height : 200.0f;
         float vp_diag = sqrtf(vp_w * vp_w + vp_h * vp_h) / 1.4142136f;
+
+        /* Resolve inherited font-size for em/ex units */
+        float font_sz = 16.0f;
+        {
+            const char *fsv;
+            int fsl = sigil__get_attr(tag.attrs, tag.attrs_len, "font-size", &fsv);
+            if (fsl > 0) {
+                font_sz = sigil__parse_length(fsv, fsl, 16.0f);
+            } else {
+                for (int gi = xform_depth; gi >= 0; gi--) {
+                    if (!g_style_stack[gi]) continue;
+                    fsl = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "font-size", &fsv);
+                    if (fsl > 0) { font_sz = sigil__parse_length(fsv, fsl, 16.0f); break; }
+                }
+            }
+            sigil__font_size_global = font_sz;
+        }
 
         if (sigil__tag_is(&tag, "path")) {
             is_shape = 1;
@@ -2763,6 +3383,15 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
 
         /* <use> element: reference another element by ID */
         if (!is_shape && sigil__tag_is(&tag, "use")) {
+            /* Check display:none on the use element itself before processing */
+            {
+                const char *use_disp;
+                const char *use_style;
+                int usl = sigil__get_attr(tag.attrs, tag.attrs_len, "style", &use_style);
+                int udl = sigil__get_prop(tag.attrs, tag.attrs_len, use_style, usl, "display", &use_disp);
+                if (udl == 4 && memcmp(use_disp, "none", 4) == 0) goto next_tag;
+            }
+
             const char *href_val;
             int href_len = sigil__get_attr(tag.attrs, tag.attrs_len, "xlink:href", &href_val);
             if (href_len == 0) href_len = sigil__get_attr(tag.attrs, tag.attrs_len, "href", &href_val);
@@ -2867,21 +3496,206 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                             ref_shape = 1;
                             const char *pts; int ptslen = sigil__get_attr(scan_tag.attrs, scan_tag.attrs_len, "points", &pts);
                             if (ptslen > 0) ref_count = sigil__polyline_to_curves(pts, ptslen, 0, &ref_curves, &ref_bounds);
+                        } else if (sigil__tag_is(&scan_tag, "g") ||
+                                   sigil__tag_is(&scan_tag, "symbol") ||
+                                   sigil__tag_is(&scan_tag, "svg")) {
+                            /* <use> referencing a container: redirect main parser
+                               into the container's children, with a return address
+                               so we jump back after the closing tag. */
+
+                            /* Cycle detection: check if we're already inside this container */
+                            int use_cycle = 0;
+                            for (int ri = 0; ri < use_return_n; ri++) {
+                                if (use_return_id_len[ri] == target_id_len &&
+                                    memcmp(use_return_id[ri], target_id, (size_t)target_id_len) == 0) {
+                                    use_cycle = 1; break;
+                                }
+                            }
+                            if (use_cycle || use_return_n >= 8) break; /* bail on cycle or too deep */
+
+                            int is_sym = sigil__tag_is(&scan_tag, "symbol") || sigil__tag_is(&scan_tag, "svg");
+
+                            /* Apply symbol/svg viewBox mapping */
+                            if (is_sym) {
+                                const char *svb;
+                                int svbl = sigil__get_attr(scan_tag.attrs, scan_tag.attrs_len, "viewBox", &svb);
+                                if (svbl > 0) {
+                                    float svb4[4] = {0,0,0,0};
+                                    sscanf(svb, "%f %f %f %f", &svb4[0], &svb4[1], &svb4[2], &svb4[3]);
+                                    /* Use width/height default to parent viewport, not viewBox size */
+                                    float def_w = scene->width > 0 ? scene->width : 200.0f;
+                                    float def_h = scene->height > 0 ? scene->height : 200.0f;
+                                    float uw = sigil__get_attr_float(tag.attrs, tag.attrs_len, "width", def_w);
+                                    float uh = sigil__get_attr_float(tag.attrs, tag.attrs_len, "height", def_h);
+                                    if (uw <= 0) uw = def_w; if (uh <= 0) uh = def_h;
+                                    if (svb4[2] > 0 && svb4[3] > 0) {
+                                        float sx = uw / svb4[2], sy = uh / svb4[3];
+                                        float s = fminf(sx, sy); /* default: xMidYMid meet */
+                                        float dx = uw - svb4[2] * s, dy = uh - svb4[3] * s;
+                                        float vb_xform[6] = {s, 0, 0, s,
+                                            -svb4[0]*s + dx*0.5f,
+                                            -svb4[1]*s + dy*0.5f};
+                                        float combined[6];
+                                        sigil__mat_multiply(xform_stack[xform_depth], vb_xform, combined);
+                                        memcpy(xform_stack[xform_depth], combined, sizeof(float)*6);
+                                    }
+                                }
+                            }
+
+                            /* Apply the container's own transform — but NOT for <symbol>
+                               (SVG 1.1: symbol elements don't support transform attribute) */
+                            if (!sigil__tag_is(&scan_tag, "symbol")) {
+                                const char *gtr;
+                                int gtrl = sigil__get_attr(scan_tag.attrs, scan_tag.attrs_len, "transform", &gtr);
+                                if (gtrl > 0) {
+                                    float gt[6]; sigil__parse_transform(gtr, gtrl, gt);
+                                    float combined[6];
+                                    sigil__mat_multiply(xform_stack[xform_depth], gt, combined);
+                                    memcpy(xform_stack[xform_depth], combined, sizeof(float)*6);
+                                }
+                            }
+
+                            g_style_stack[xform_depth] = scan_tag.attrs;
+                            g_style_len_stack[xform_depth] = scan_tag.attrs_len;
+
+                            /* Save return address and target ID for cycle detection */
+                            if (use_return_n < 8) {
+                                use_return_pos[use_return_n] = pos;
+                                use_return_depth[use_return_n] = xform_depth;
+                                use_return_id[use_return_n] = target_id;
+                                use_return_id_len[use_return_n] = target_id_len;
+                                use_return_n++;
+                            }
+                            pos = scan_pos;
+                            /* ref_shape stays 0; is_shape stays 0;
+                               main loop continues from children.
+                               Closing tag handler returns us after the <use>. */
+                            break;
+                        } else if (sigil__tag_is(&scan_tag, "use")) {
+                            /* Indirect <use>: resolve chain with cycle detection */
+                            const char *visited[10];
+                            int visited_len[10];
+                            int visited_n = 0;
+                            visited[visited_n] = target_id;
+                            visited_len[visited_n] = target_id_len;
+                            visited_n++;
+
+                            SigilTag chain_tag = scan_tag;
+                            while (visited_n < 10) {
+                                const char *chr;
+                                int chrl = sigil__get_attr(chain_tag.attrs, chain_tag.attrs_len, "xlink:href", &chr);
+                                if (chrl == 0) chrl = sigil__get_attr(chain_tag.attrs, chain_tag.attrs_len, "href", &chr);
+                                if (chrl <= 1 || chr[0] != '#') break;
+                                const char *next_id = chr + 1;
+                                int next_id_len = chrl - 1;
+
+                                /* Cycle detection */
+                                int is_cycle = 0;
+                                for (int v = 0; v < visited_n; v++) {
+                                    if (visited_len[v] == next_id_len &&
+                                        memcmp(visited[v], next_id, (size_t)next_id_len) == 0) {
+                                        is_cycle = 1; break;
+                                    }
+                                }
+                                if (is_cycle) break;
+                                visited[visited_n] = next_id;
+                                visited_len[visited_n] = next_id_len;
+                                visited_n++;
+
+                                /* Apply intermediate use's x/y */
+                                float ix = sigil__get_attr_float(chain_tag.attrs, chain_tag.attrs_len, "x", 0);
+                                float iy = sigil__get_attr_float(chain_tag.attrs, chain_tag.attrs_len, "y", 0);
+                                if (fabsf(ix) > 1e-6f || fabsf(iy) > 1e-6f) {
+                                    float it[6] = {1,0,0,1, ix, iy};
+                                    float combined[6];
+                                    sigil__mat_multiply(xform_stack[xform_depth], it, combined);
+                                    memcpy(xform_stack[xform_depth], combined, sizeof(float)*6);
+                                }
+
+                                /* Scan for the next target */
+                                int scan2 = 0;
+                                SigilTag scan2_tag;
+                                int found_next = 0;
+                                while (sigil__next_tag(svg_data, (int)len, &scan2, &scan2_tag)) {
+                                    if (scan2_tag.is_close) continue;
+                                    const char *sid2;
+                                    int sid2l = sigil__get_attr(scan2_tag.attrs, scan2_tag.attrs_len, "id", &sid2);
+                                    if (sid2l == next_id_len && memcmp(sid2, next_id, (size_t)sid2l) == 0) {
+                                        if (sigil__tag_is(&scan2_tag, "use")) {
+                                            chain_tag = scan2_tag;
+                                            found_next = 1;
+                                        } else {
+                                            /* Final target: process as shape */
+                                            if (sigil__tag_is(&scan2_tag, "rect")) {
+                                                ref_shape = 1;
+                                                float x = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "x", 0, rvp_w);
+                                                float y = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "y", 0, rvp_h);
+                                                float w = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "width", 0, rvp_w);
+                                                float h = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "height", 0, rvp_h);
+                                                float rrx = sigil__get_attr_float(scan2_tag.attrs, scan2_tag.attrs_len, "rx", -1);
+                                                float rry = sigil__get_attr_float(scan2_tag.attrs, scan2_tag.attrs_len, "ry", -1);
+                                                if (rrx < 0 && rry >= 0) rrx = rry; if (rry < 0 && rrx >= 0) rry = rrx;
+                                                if (rrx < 0) rrx = 0; if (rry < 0) rry = 0;
+                                                if (w > 0 && h > 0) ref_count = sigil__rect_to_curves(x,y,w,h,rrx,rry,&ref_curves,&ref_bounds);
+                                            } else if (sigil__tag_is(&scan2_tag, "circle")) {
+                                                ref_shape = 1;
+                                                float cx = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "cx", 0, rvp_w);
+                                                float cy = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "cy", 0, rvp_h);
+                                                float r = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "r", 0, rvp_w);
+                                                if (r > 0) ref_count = sigil__circle_to_curves(cx,cy,r,&ref_curves,&ref_bounds);
+                                            } else if (sigil__tag_is(&scan2_tag, "ellipse")) {
+                                                ref_shape = 1;
+                                                float cx = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "cx", 0, rvp_w);
+                                                float cy = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "cy", 0, rvp_h);
+                                                float erx = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "rx", -1, rvp_w);
+                                                float ery = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "ry", -1, rvp_h);
+                                                if (erx < 0 && ery >= 0) erx = ery; if (ery < 0 && erx >= 0) ery = erx;
+                                                if (erx < 0) erx = 0; if (ery < 0) ery = 0;
+                                                if (erx > 0 && ery > 0) ref_count = sigil__ellipse_to_curves(cx,cy,erx,ery,&ref_curves,&ref_bounds);
+                                            } else if (sigil__tag_is(&scan2_tag, "line")) {
+                                                ref_shape = 1;
+                                                float x1 = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "x1", 0, rvp_w);
+                                                float y1 = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "y1", 0, rvp_h);
+                                                float x2 = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "x2", 0, rvp_w);
+                                                float y2 = sigil__get_attr_vp(scan2_tag.attrs, scan2_tag.attrs_len, "y2", 0, rvp_h);
+                                                ref_count = sigil__line_to_curves(x1,y1,x2,y2,&ref_curves,&ref_bounds);
+                                            } else if (sigil__tag_is(&scan2_tag, "path")) {
+                                                ref_shape = 1;
+                                                const char *d; int dlen = sigil__get_attr(scan2_tag.attrs, scan2_tag.attrs_len, "d", &d);
+                                                if (dlen > 0 && d) {
+                                                    char *dbuf = (char *)malloc((size_t)dlen + 1);
+                                                    memcpy(dbuf, d, (size_t)dlen); dbuf[dlen] = '\0';
+                                                    ref_count = sigil__parse_path(dbuf, &ref_curves, &ref_bounds);
+                                                    free(dbuf);
+                                                }
+                                            } else if (sigil__tag_is(&scan2_tag, "polygon")) {
+                                                ref_shape = 1;
+                                                const char *pts; int ptslen = sigil__get_attr(scan2_tag.attrs, scan2_tag.attrs_len, "points", &pts);
+                                                if (ptslen > 0) ref_count = sigil__polyline_to_curves(pts, ptslen, 1, &ref_curves, &ref_bounds);
+                                            } else if (sigil__tag_is(&scan2_tag, "polyline")) {
+                                                ref_shape = 1;
+                                                const char *pts; int ptslen = sigil__get_attr(scan2_tag.attrs, scan2_tag.attrs_len, "points", &pts);
+                                                if (ptslen > 0) ref_count = sigil__polyline_to_curves(pts, ptslen, 0, &ref_curves, &ref_bounds);
+                                            }
+                                            if (ref_shape) scan_tag = scan2_tag;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!found_next || ref_shape) break;
+                            }
                         }
 
                         if (ref_shape && ref_count > 0) {
-                            /* Use the referenced element as the current shape,
-                               with the use element providing style overrides
-                               and the scan_tag providing fallback styles */
                             is_shape = 1;
+                            use_shape_frame = 1;
                             curves = ref_curves;
                             curve_count = ref_count;
                             shape_bounds = ref_bounds;
-
-                            /* Override tag with scan_tag for style resolution,
-                               but keep use element's attrs in group stack for inheritance */
                             tag = scan_tag;
-                        } else {
+                        } else if (use_return_n == 0 ||
+                                   use_return_depth[use_return_n-1] != xform_depth) {
+                            /* Only pop use frame if we didn't set up a container redirect */
                             free(ref_curves);
                             if (xform_depth > 0) xform_depth--;
                         }
@@ -2927,13 +3741,20 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         {
             const char *cc_val;
             int cc_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "color", &cc_val);
+            int cr = 0;
             if (cc_len > 0) {
-                sigil__parse_color(cc_val, cc_len, current_color);
-            } else {
+                cr = sigil__parse_color(cc_val, cc_len, current_color);
+            }
+            /* If not set or inherit, walk parent groups */
+            if (cc_len == 0 || cr == SIGIL_COLOR_INHERIT) {
                 for (int gi = xform_depth; gi >= 0; gi--) {
                     if (!g_style_stack[gi]) continue;
                     cc_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "color", &cc_val);
-                    if (cc_len > 0) { sigil__parse_color(cc_val, cc_len, current_color); break; }
+                    if (cc_len > 0) {
+                        int gcr = sigil__parse_color(cc_val, cc_len, current_color);
+                        if (gcr != SIGIL_COLOR_INHERIT) break;
+                        /* else continue walking up */
+                    }
                 }
             }
         }
@@ -2965,11 +3786,15 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 hash++;
                 const char *end_paren = memchr(hash, ')', (size_t)(fill_vlen - (int)(hash - fill_val)));
                 int id_len = end_paren ? (int)(end_paren - hash) : (int)(fill_vlen - (int)(hash - fill_val));
+                /* Trim whitespace and optional quotes from id */
+                while (id_len > 0 && isspace((unsigned char)hash[id_len-1])) id_len--;
+                while (id_len > 0 && (hash[id_len-1] == '\'' || hash[id_len-1] == '"')) id_len--;
                 for (int gi = 0; gi < grad_defs.count; gi++) {
                     if ((int)strlen(grad_defs.data[gi].id) == id_len &&
                         memcmp(grad_defs.data[gi].id, hash, (size_t)id_len) == 0) {
-                        /* Only use gradient if it has stops */
-                        if (grad_defs.data[gi].stop_count > 0) {
+                        /* Accept if has stops or has href (stops inherited later) */
+                        if (grad_defs.data[gi].stop_count > 0 ||
+                            grad_defs.data[gi].href[0] != '\0') {
                             fill_gradient_idx = gi;
                             has_fill = 1;
                         }
@@ -3003,9 +3828,24 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                     int gflen = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "fill", &gf);
                     if (gflen > 0) {
                         int gcr = sigil__parse_color(gf, gflen, fill_color);
-                        if (gcr == SIGIL_COLOR_CURRENT) { memcpy(fill_color, current_color, 16); has_fill = 1; }
-                        else has_fill = (gcr == SIGIL_COLOR_VALID);
-                        break;
+                        if (gcr == SIGIL_COLOR_CURRENT) { memcpy(fill_color, current_color, 16); has_fill = 1; break; }
+                        else if (gcr == SIGIL_COLOR_INHERIT) continue; /* keep walking up */
+                        else if (gcr == SIGIL_COLOR_VALID) { has_fill = 1; break; }
+                        else { has_fill = 0; break; } /* none */
+                    }
+                }
+                /* If no parent had fill, use initial value (black) */
+                if (!has_fill) {
+                    int found_any = 0;
+                    for (int gi = xform_depth; gi >= 0; gi--) {
+                        if (g_style_stack[gi]) {
+                            const char *gf; int gflen = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "fill", &gf);
+                            if (gflen > 0) { found_any = 1; break; }
+                        }
+                    }
+                    if (!found_any) {
+                        fill_color[0] = 0; fill_color[1] = 0; fill_color[2] = 0; fill_color[3] = 1;
+                        has_fill = 1; /* inherit with no parent = initial value (black) */
                     }
                 }
             } else if (cr == SIGIL_COLOR_NONE) {
@@ -3043,10 +3883,45 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             }
         }
 
-        /* Stroke color with currentColor/inherit support */
+        /* Stroke color with currentColor/inherit/gradient support */
         const char *stroke_val;
         int stroke_vlen = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke", &stroke_val);
-        if (stroke_vlen > 0) {
+        if (stroke_vlen > 4 && memcmp(stroke_val, "url(", 4) == 0) {
+            /* Stroke gradient */
+            has_stroke = 0;
+            const char *hash = memchr(stroke_val, '#', (size_t)stroke_vlen);
+            if (hash && grad_defs.count > 0) {
+                hash++;
+                const char *end_paren = memchr(hash, ')', (size_t)(stroke_vlen - (int)(hash - stroke_val)));
+                int sid_len = end_paren ? (int)(end_paren - hash) : (int)(stroke_vlen - (int)(hash - stroke_val));
+                while (sid_len > 0 && isspace((unsigned char)hash[sid_len-1])) sid_len--;
+                for (int gi = 0; gi < grad_defs.count; gi++) {
+                    if ((int)strlen(grad_defs.data[gi].id) == sid_len &&
+                        memcmp(grad_defs.data[gi].id, hash, (size_t)sid_len) == 0) {
+                        if (grad_defs.data[gi].stop_count > 0 ||
+                            grad_defs.data[gi].href[0] != '\0') {
+                            stroke_gradient_idx = gi;
+                            has_stroke = 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            /* Fallback color after url() */
+            if (!has_stroke) {
+                const char *cp = memchr(stroke_val, ')', (size_t)stroke_vlen);
+                if (cp) {
+                    cp++;
+                    int rem = stroke_vlen - (int)(cp - stroke_val);
+                    while (rem > 0 && isspace((unsigned char)*cp)) { cp++; rem--; }
+                    if (rem > 0) {
+                        int cr = sigil__parse_color(cp, rem, stroke_color);
+                        if (cr == SIGIL_COLOR_CURRENT) { memcpy(stroke_color, current_color, 16); cr = 1; }
+                        has_stroke = (cr == SIGIL_COLOR_VALID);
+                    }
+                }
+            }
+        } else if (stroke_vlen > 0) {
             int cr = sigil__parse_color(stroke_val, stroke_vlen, stroke_color);
             if (cr == SIGIL_COLOR_CURRENT) {
                 memcpy(stroke_color, current_color, sizeof(float)*4); has_stroke = 1;
@@ -3074,7 +3949,11 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             }
         }
 
-        stroke_width = sigil__get_prop_float(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-width", 0);
+        {
+            const char *sw_val;
+            int sw_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-width", &sw_val);
+            if (sw_len > 0) stroke_width = sigil__parse_length(sw_val, sw_len, vp_diag);
+        }
         /* Inherit stroke-width from parent groups */
         if (stroke_width == 0 && has_stroke) {
             for (int gi = xform_depth; gi >= 0; gi--) {
@@ -3085,13 +3964,18 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         }
         if (has_stroke && stroke_width == 0) stroke_width = 1.0f; /* SVG default */
 
-        /* Parse opacity values — handle both number and percentage */
+        /* Parse opacity values — handle both number and percentage.
+           Reject invalid values with unit suffixes (e.g. "0.1mm"). */
         #define SIGIL__PARSE_OPACITY(prop, var) do { \
             const char *_ov; \
             int _ol = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, prop, &_ov); \
             if (_ol > 0) { \
-                var = strtof(_ov, NULL); \
-                if (_ol > 0 && _ov[_ol-1] == '%') var /= 100.0f; \
+                char *_ep; float _v = strtof(_ov, &_ep); \
+                int _rem = _ol - (int)(_ep - _ov); \
+                while (_rem > 0 && isspace((unsigned char)*_ep)) { _ep++; _rem--; } \
+                if (_rem == 0) { var = _v; } \
+                else if (_rem == 1 && *_ep == '%') { var = _v / 100.0f; } \
+                /* else: invalid unit suffix, keep default */ \
                 if (var < 0) var = 0; if (var > 1) var = 1; \
             } \
         } while(0)
@@ -3099,6 +3983,31 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         SIGIL__PARSE_OPACITY("fill-opacity", fill_opacity);
         SIGIL__PARSE_OPACITY("stroke-opacity", stroke_opacity);
         #undef SIGIL__PARSE_OPACITY
+
+        /* Multiply in parent group opacity values (opacity is NOT inherited per spec,
+           but it does compose: each group's opacity multiplies into descendants) */
+        {
+            const char *_ov;
+            int _ol = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "opacity", &_ov);
+            if (_ol == 0) {
+                /* No opacity on this element — check parent groups for opacity */
+                for (int gi = xform_depth; gi >= 0; gi--) {
+                    if (!g_style_stack[gi]) continue;
+                    int gol = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "opacity", &_ov);
+                    if (gol > 0) {
+                        char *_ep; float gop = strtof(_ov, &_ep);
+                        int _rem = gol - (int)(_ep - _ov);
+                        while (_rem > 0 && isspace((unsigned char)*_ep)) { _ep++; _rem--; }
+                        if (_rem == 0 || (_rem == 1 && *_ep == '%')) {
+                            if (_rem == 1 && *_ep == '%') gop /= 100.0f;
+                            if (gop < 0) gop = 0; if (gop > 1) gop = 1;
+                            opacity *= gop;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         /* Inherit fill-opacity from parent groups */
         {
@@ -3167,20 +4076,83 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 line_cap = SIGIL_CAP_SQUARE;
         }
 
-        /* stroke-miterlimit: element, then group inheritance */
+        /* stroke-miterlimit: element, then group inheritance.
+           miterlimit is a <number>, not a <length> — reject unit suffixes */
         float miter_limit = 4.0f;
         {
-            miter_limit = sigil__get_prop_float(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-miterlimit", 0);
-            if (miter_limit == 0) {
-                for (int gi = xform_depth; gi >= 0; gi--) {
-                    if (g_style_stack[gi]) {
-                        miter_limit = sigil__get_attr_float(g_style_stack[gi], g_style_len_stack[gi], "stroke-miterlimit", 0);
-                        if (miter_limit != 0) break;
-                    }
+            const char *ml_val;
+            int ml_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-miterlimit", &ml_val);
+            if (ml_len == 0) {
+                for (int gi = xform_depth; gi >= 0 && ml_len == 0; gi--) {
+                    if (g_style_stack[gi])
+                        ml_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stroke-miterlimit", &ml_val);
                 }
-                if (miter_limit == 0) miter_limit = 4.0f;
             }
-            if (miter_limit < 1.0f) miter_limit = 1.0f; /* SVG spec minimum */
+            if (ml_len > 0) {
+                char *ml_end;
+                float ml_v = strtof(ml_val, &ml_end);
+                /* Reject if has unit suffix (miterlimit is a pure number) */
+                int ml_rem = ml_len - (int)(ml_end - ml_val);
+                while (ml_rem > 0 && isspace((unsigned char)*ml_end)) { ml_end++; ml_rem--; }
+                if (ml_rem == 0 && ml_v >= 1.0f)
+                    miter_limit = ml_v;
+                /* else: invalid value, keep default 4.0 */
+            }
+            if (miter_limit < 1.0f) miter_limit = 4.0f; /* SVG spec: values < 1 are invalid, use default */
+        }
+
+        /* stroke-dasharray: parse dash pattern */
+        float dash_array[16];
+        int dash_count = 0;
+        float dash_offset = 0;
+        {
+            const char *da_val;
+            int da_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-dasharray", &da_val);
+            if (da_len == 0) {
+                for (int gi = xform_depth; gi >= 0 && da_len == 0; gi--) {
+                    if (g_style_stack[gi])
+                        da_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stroke-dasharray", &da_val);
+                }
+            }
+            if (da_len > 0 && da_val && !(da_len == 4 && memcmp(da_val, "none", 4) == 0)) {
+                const char *p = da_val;
+                const char *end = da_val + da_len;
+                while (p < end && dash_count < 16) {
+                    while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+                    if (p >= end) break;
+                    float v = sigil__parse_length(p, (int)(end - p), vp_diag);
+                    char *ep;
+                    strtof(p, &ep);
+                    if (ep == p) break;
+                    /* Skip past number and any unit suffix */
+                    p = ep;
+                    while (p < end && isalpha((unsigned char)*p)) p++;
+                    while (p < end && *p == '%') p++;
+                    if (v < 0) v = 0;
+                    dash_array[dash_count++] = v;
+                }
+                /* SVG spec: if odd count, repeat the array to make even */
+                if (dash_count > 0 && (dash_count & 1)) {
+                    int orig = dash_count;
+                    for (int i = 0; i < orig && dash_count < 16; i++)
+                        dash_array[dash_count++] = dash_array[i];
+                }
+                /* Check if all zeros (equivalent to none) */
+                int all_zero = 1;
+                for (int i = 0; i < dash_count; i++)
+                    if (dash_array[i] > 0) { all_zero = 0; break; }
+                if (all_zero) dash_count = 0;
+            }
+            /* stroke-dashoffset */
+            const char *do_val;
+            int do_len = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "stroke-dashoffset", &do_val);
+            if (do_len == 0) {
+                for (int gi = xform_depth; gi >= 0 && do_len == 0; gi--) {
+                    if (g_style_stack[gi])
+                        do_len = sigil__get_attr(g_style_stack[gi], g_style_len_stack[gi], "stroke-dashoffset", &do_val);
+                }
+            }
+            if (do_len > 0) dash_offset = sigil__parse_length(do_val, do_len, vp_diag);
         }
 
         /* Get element transform (transform is not a CSS property, only an attribute) */
@@ -3208,6 +4180,16 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             sigil__transform_curves(curves, curve_count, accum, &shape_bounds);
         }
 
+        /* Apply stroke dash array before stroke-to-fill */
+        SigilCurve *dashed_curves = NULL;
+        int dashed_count = 0;
+        if (has_stroke && dash_count > 0 && curve_count > 0) {
+            SigilBounds dash_bounds;
+            dashed_count = sigil__apply_dash(curves, curve_count,
+                                              dash_array, dash_count, dash_offset,
+                                              &dashed_curves, &dash_bounds);
+        }
+
         /* Implicitly close open subpaths for fill (SVG spec: open subpaths
            are treated as closed when filling) */
         if (has_fill && curve_count > 0) {
@@ -3225,17 +4207,21 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         /* Handle stroke-to-fill conversion */
         if (!has_fill && has_stroke && stroke_width > 0 && curve_count > 0) {
             /* Fill=none, stroke set: convert stroke to fill */
+            SigilCurve *stroke_src = (dashed_count > 0) ? dashed_curves : curves;
+            int stroke_src_count = (dashed_count > 0) ? dashed_count : curve_count;
             SigilCurve *stroke_curves = NULL;
             SigilBounds stroke_bounds;
-            int sc = sigil__stroke_to_fill(curves, curve_count, stroke_width,
+            int sc = sigil__stroke_to_fill(stroke_src, stroke_src_count, stroke_width,
                                             line_join, line_cap, miter_limit,
                                             &stroke_curves, &stroke_bounds);
             free(curves);
+            if (dashed_curves) { free(dashed_curves); dashed_curves = NULL; }
             curves = stroke_curves;
             curve_count = sc;
             shape_bounds = stroke_bounds;
-            /* Use stroke color as fill */
+            /* Use stroke color/gradient as fill */
             memcpy(fill_color, stroke_color, sizeof(float) * 4);
+            fill_gradient_idx = stroke_gradient_idx;
             has_fill = 1;
             has_stroke = 0;
         }
@@ -3260,11 +4246,12 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         /* If both fill and stroke, add a second element for stroke outline */
         if (has_fill && has_stroke && stroke_width > 0 && curves == NULL &&
             elems.count > 0) {
-            /* We need to get curves back from the fill element to offset them */
             SigilElement *fillElem = &elems.data[elems.count - 1];
+            SigilCurve *stroke_src2 = (dashed_count > 0) ? dashed_curves : fillElem->curves;
+            int stroke_src2_count = (dashed_count > 0) ? dashed_count : (int)fillElem->curve_count;
             SigilCurve *stroke_curves = NULL;
             SigilBounds stroke_bounds;
-            int sc = sigil__stroke_to_fill(fillElem->curves, (int)fillElem->curve_count,
+            int sc = sigil__stroke_to_fill(stroke_src2, stroke_src2_count,
                                             stroke_width, line_join, line_cap, miter_limit,
                                             &stroke_curves, &stroke_bounds);
             if (sc > 0) {
@@ -3277,12 +4264,32 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 se->fill_rule = fill_rule;
                 se->opacity = opacity * stroke_opacity;
                 se->bounds = stroke_bounds;
+                se->fill_gradient_idx = stroke_gradient_idx;
                 sigil__build_bands(se);
             }
         }
 
         /* Free curves if not transferred */
         free(curves);
+        free(dashed_curves);
+
+        /* Pop the use element's transform frame after rendering the shape */
+        if (use_shape_frame && xform_depth > 0) xform_depth--;
+
+        /* Skip children of basic shape elements (they can't have child shapes per SVG spec) */
+        if (is_shape && !tag.self_close) {
+            /* Find the matching closing tag for this basic shape */
+            const char *tn = tag.name;
+            int tnl = tag.name_len;
+            int depth = 1;
+            SigilTag skip_tag;
+            while (depth > 0 && sigil__next_tag(svg_data, (int)len, &pos, &skip_tag)) {
+                if (skip_tag.name_len == tnl && memcmp(skip_tag.name, tn, (size_t)tnl) == 0) {
+                    if (skip_tag.is_close) depth--;
+                    else if (!skip_tag.self_close) depth++;
+                }
+            }
+        }
     next_tag:;
     }
 
@@ -3292,6 +4299,47 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
     /* Resolve gradient href inheritance and store in scene */
     if (grad_defs.count > 0) {
         sigil__resolve_gradient_hrefs(&grad_defs);
+        /* Post-pass: fix radial gradient focal defaults (fx/fy default to cx/cy)
+           and enforce monotonically increasing stop offsets */
+        for (int i = 0; i < grad_defs.count; i++) {
+            SigilGradientDef *g = &grad_defs.data[i];
+            if (g->type == 2) {
+                if (g->fx < -0.5f) g->fx = g->cx;
+                if (g->fy < -0.5f) g->fy = g->cy;
+            }
+            /* SVG spec: stop offsets must be monotonically non-decreasing */
+            for (int s = 1; s < g->stop_count; s++) {
+                if (g->stops[s].offset < g->stops[s-1].offset)
+                    g->stops[s].offset = g->stops[s-1].offset;
+            }
+            /* userSpaceOnUse: convert default (0-1) and percent values to viewport coords.
+               Default values are stored as objectBoundingBox fractions (0-1 range).
+               For userSpaceOnUse, SVG spec defines defaults as percentages of the viewport. */
+            if (!g->objectBBox) {
+                float vw = scene->viewBox[2] > 0 ? scene->viewBox[2] : (scene->width > 0 ? scene->width : 300.0f);
+                float vh = scene->viewBox[3] > 0 ? scene->viewBox[3] : (scene->height > 0 ? scene->height : 150.0f);
+                if (g->type == 1) {
+                    /* Linear: defaults x1=0%, y1=0%, x2=100%, y2=0% are stored as 0,0,1,0 */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_X1) || (g->attrs_set & SIGIL_GRAD_PCT_X1)) g->x1 *= vw;
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_Y1) || (g->attrs_set & SIGIL_GRAD_PCT_Y1)) g->y1 *= vh;
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_X2) || (g->attrs_set & SIGIL_GRAD_PCT_X2)) g->x2 *= vw;
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_Y2) || (g->attrs_set & SIGIL_GRAD_PCT_Y2)) g->y2 *= vh;
+                } else if (g->type == 2) {
+                    /* Radial: defaults cx=50%, cy=50%, r=50% stored as 0.5, 0.5, 0.5 */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_CX) || (g->attrs_set & SIGIL_GRAD_PCT_CX)) g->cx *= vw;
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_CY) || (g->attrs_set & SIGIL_GRAD_PCT_CY)) g->cy *= vh;
+                    float diag = sqrtf(vw*vw + vh*vh) / 1.41421356f; /* normalized diagonal */
+                    /* r percentage is relative to the normalized diagonal per SVG 2 spec */
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_R)  || (g->attrs_set & SIGIL_GRAD_PCT_R))  g->r  *= diag;
+                    if (g->attrs_set & SIGIL_GRAD_PCT_FX) g->fx *= vw;
+                    if (g->attrs_set & SIGIL_GRAD_PCT_FY) g->fy *= vh;
+                    if (!(g->attrs_set & SIGIL_GRAD_HAS_FR) || (g->attrs_set & SIGIL_GRAD_PCT_FR)) g->fr *= diag;
+                    /* Re-apply focal defaults after coordinate conversion */
+                    if (g->fx < -0.5f) g->fx = g->cx;
+                    if (g->fy < -0.5f) g->fy = g->cy;
+                }
+            }
+        }
         scene->gradients = grad_defs.data;
         scene->gradient_count = grad_defs.count;
     }
@@ -3723,7 +4771,18 @@ SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
                 float sy = sqrtf(gd->transform[2]*gd->transform[2] + gd->transform[3]*gd->transform[3]);
                 float tscale = (sx + sy) * 0.5f;
                 grad0[0] = tcx; grad0[1] = tcy; grad0[2] = tfx; grad0[3] = tfy;
-                grad1[2] = gr * tscale; /* transformed outer radius */
+                float tr = gr * tscale;  /* transformed outer radius */
+                float tfr = gd->fr;
+                if (gd->objectBBox) tfr *= fmaxf(ew, eh);
+                tfr *= tscale;
+                /* Encode fr/r ratio in fractional part of spread:
+                   grad1[3] = spread + fr_ratio * 0.001
+                   Shader decodes: fr_ratio = fract(val) * 1000 */
+                float fr_ratio = (tr > 0) ? (tfr / tr) : 0.0f;
+                if (fr_ratio < 0) fr_ratio = 0;
+                if (fr_ratio > 99.0f) fr_ratio = 99.0f;
+                grad1[2] = tr;
+                grad1[3] = (float)gd->spread + fr_ratio * 0.001f;
             }
         }
 
@@ -3816,6 +4875,9 @@ SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
     gs->gradientCount = (uint32_t)gradCount;
     gs->hasViewBox = scene->has_viewBox;
     memcpy(gs->viewBox, scene->viewBox, sizeof(float) * 4);
+    gs->par_align = scene->par_align;
+    gs->par_meet_or_slice = scene->par_meet_or_slice;
+    gs->par_none = scene->par_none;
 
     /* Deep-copy gradient defs for CPU ramp baking */
     if (gradCount > 0) {
@@ -4075,10 +5137,25 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
         vbW = viewport_w;
         vbH = viewport_h;
     }
-    float scale    = (vbW > 0 && vbH > 0)
-                   ? (viewport_w / vbW < viewport_h / vbH ? viewport_w / vbW : viewport_h / vbH)
-                   : 1.0f;
-    float invScale = (scale > 0.0f) ? 1.0f / scale : 1.0f;
+    float scaleX, scaleY, parOX = 0, parOY = 0;
+    if (vbW > 0 && vbH > 0) {
+        float sx = viewport_w / vbW, sy = viewport_h / vbH;
+        if (gs->par_none) {
+            scaleX = sx; scaleY = sy;
+        } else {
+            float s = gs->par_meet_or_slice ? fmaxf(sx, sy) : fminf(sx, sy);
+            scaleX = s; scaleY = s;
+            float dx = viewport_w - vbW * s;
+            float dy = viewport_h - vbH * s;
+            int xa = gs->par_align % 3, ya = gs->par_align / 3;
+            parOX = xa == 0 ? 0 : (xa == 1 ? dx * 0.5f : dx);
+            parOY = ya == 0 ? 0 : (ya == 1 ? dy * 0.5f : dy);
+        }
+    } else {
+        scaleX = 1.0f; scaleY = 1.0f;
+    }
+    float invScaleX = (scaleX > 0.0f) ? 1.0f / scaleX : 1.0f;
+    float invScaleY = (scaleY > 0.0f) ? 1.0f / scaleY : 1.0f;
 
     uint32_t ec = gs->elementCount;
     uint32_t *elemData   = gs->cpuElemData;
@@ -4249,10 +5326,10 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
         float bsY = eh > 0 ? 8.0f / eh : 0.0f;
         float boX = -xMin * bsX, boY = -yMin * bsY;
 
-        float px0 = (xMin - vbX) * scale;
-        float py0 = (yMin - vbY) * scale;
-        float px1 = (xMax - vbX) * scale;
-        float py1 = (yMax - vbY) * scale;
+        float px0 = (xMin - vbX) * scaleX + parOX;
+        float py0 = (yMin - vbY) * scaleY + parOY;
+        float px1 = (xMax - vbX) * scaleX + parOX;
+        float py1 = (yMax - vbY) * scaleY + parOY;
 
         uint32_t bandStart = offsetData[ei * 2 + 1];
         uint32_t glpU32 = bandStart;
@@ -4290,7 +5367,7 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
             vp[2] = corners[v][2]; vp[3] = corners[v][3];
             vp[4] = emCoords[v][0]; vp[5] = emCoords[v][1];
             vp[6] = glp; vp[7] = bmp;
-            vp[8] = invScale; vp[9] = 0; vp[10] = 0; vp[11] = invScale;
+            vp[8] = invScaleX; vp[9] = 0; vp[10] = 0; vp[11] = invScaleY;
             vp[12] = bsX; vp[13] = bsY; vp[14] = boX; vp[15] = boY;
             vp[16] = cr; vp[17] = cg; vp[18] = cb; vp[19] = alpha;
             vp[20] = g0[0]; vp[21] = g0[1]; vp[22] = g0[2]; vp[23] = g0[3];
