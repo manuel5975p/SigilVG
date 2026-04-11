@@ -2612,6 +2612,9 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         int fill_gradient_idx = -1;
         int stroke_gradient_idx = -1;
 
+        /* <line> elements have no interior area; default fill to none */
+        if (sigil__tag_is(&tag, "line")) has_fill = 0;
+
         const char *fill_val;
         int fill_vlen = sigil__get_prop(tag.attrs, tag.attrs_len, style_str, style_len, "fill", &fill_val);
         if (fill_vlen > 0) {
@@ -3021,6 +3024,7 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
             .minFilter = WGPUFilterMode_Linear,
             .addressModeU = WGPUAddressMode_ClampToEdge,
             .addressModeV = WGPUAddressMode_ClampToEdge,
+            .addressModeW = WGPUAddressMode_ClampToEdge,
         });
 
     /* ---- Prepare compute: bind group layouts ---- */

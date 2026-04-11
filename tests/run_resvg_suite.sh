@@ -7,6 +7,30 @@ SUITE_DIR="${2:-../tests/resvg_suite/tests}"
 OUT_DIR="${3:-resvg_results}"
 TIMEOUT_SEC=5
 
+# macOS has no 'timeout'; use gtimeout from coreutils or a perl fallback
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    # Pure-shell fallback: run in background, kill after TIMEOUT_SEC
+    timeout_fallback() {
+        local secs="$1"; shift
+        "$@" &
+        local pid=$!
+        (sleep "$secs" && kill "$pid" 2>/dev/null) &
+        local watcher=$!
+        wait "$pid" 2>/dev/null
+        local ec=$?
+        kill "$watcher" 2>/dev/null
+        wait "$watcher" 2>/dev/null
+        # If killed by our watchdog, exit 124 like GNU timeout
+        if [ $ec -gt 128 ]; then ec=124; fi
+        return $ec
+    }
+    TIMEOUT_CMD="timeout_fallback"
+fi
+
 mkdir -p "$OUT_DIR"
 
 total=0
@@ -28,7 +52,7 @@ find "$SUITE_DIR" -name "*.svg" -type f | sort | while read -r svgpath; do
     outpng="$OUT_DIR/${category}_${subcategory}_${name}.png"
 
     # Run with timeout
-    stderr_out=$(timeout "$TIMEOUT_SEC" "$HEADLESS" "$svgpath" "$outpng" 2>&1)
+    stderr_out=$($TIMEOUT_CMD "$TIMEOUT_SEC" "$HEADLESS" "$svgpath" "$outpng" 2>&1)
     ec=$?
 
     total=$((total + 1))

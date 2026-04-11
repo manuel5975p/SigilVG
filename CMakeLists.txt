@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
 project(sigilvg C)
+if(APPLE)
+    enable_language(OBJC)
+endif()
 include(FetchContent)
 
 # --- WGVK (WebGPU on Vulkan) with simple_wgsl shader compiler ---
@@ -86,6 +89,9 @@ if(NOT EMSCRIPTEN)
     endif()
 
     add_executable(sigilvg_viewer examples/viewer.c)
+    if(APPLE)
+        set_source_files_properties(examples/viewer.c PROPERTIES LANGUAGE OBJC)
+    endif()
     target_link_libraries(sigilvg_viewer PRIVATE sigilvg glfw)
     target_include_directories(sigilvg_viewer PRIVATE
         "${STB_DIR}"

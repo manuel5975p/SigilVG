@@ -317,8 +317,8 @@ static void write_diff_image(const Image *a, const Image *b, const char *path, i
 /* Composite RGBA image onto SigilVG's clear color (0.05, 0.05, 0.1, 1.0)
    so PlutoSVG's transparent background matches SigilVG's. */
 static void composite_on_clear_color(Image *img) {
-    /* SigilVG clear: (0.05, 0.05, 0.1, 1.0) → (13, 13, 26, 255) */
-    const unsigned char bgr = 13, bgg = 13, bgb = 26;
+    /* SigilVG clear: white (1.0, 1.0, 1.0, 1.0) → (255, 255, 255, 255) */
+    const unsigned char bgr = 255, bgg = 255, bgb = 255;
     for (int i = 0; i < img->w * img->h; i++) {
         unsigned char *p = img->pixels + i * 4;
         int a = p[3];
