@@ -157,6 +157,13 @@ if(NOT EMSCRIPTEN)
         target_link_libraries(sigilvg_batch_pixel PRIVATE m)
     endif()
 
+    add_executable(sigilvg_resvg_suite tests/test_resvg_suite.c)
+    target_link_libraries(sigilvg_resvg_suite PRIVATE sigilvg)
+    target_include_directories(sigilvg_resvg_suite PRIVATE "${STB_DIR}")
+    if(NOT MSVC)
+        target_link_libraries(sigilvg_resvg_suite PRIVATE m)
+    endif()
+
 endif()
 
 # --- Emscripten web demo ---
