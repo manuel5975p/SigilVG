@@ -2050,13 +2050,23 @@ static void sigil__emit_cap(SigilCurveArray *arr, SigilLineCap capstyle,
     }
 }
 
-/* ---- Inner join: route through vertex to avoid self-intersection ---- */
+/* ---- Inner join: route through vertex for sharp turns, direct for smooth ---- */
 static void sigil__inner_join(SigilCurveArray *arr,
                                float vx, float vy,
                                float ipx, float ipy,
                                float inx, float iny) {
-    sigil__curve_array_push(arr, sigil__line_to_quad(ipx, ipy, vx, vy));
-    sigil__curve_array_push(arr, sigil__line_to_quad(vx, vy, inx, iny));
+    /* For nearly-collinear segments (ip ≈ in), use direct connection to
+       avoid thin triangular protrusions that cause Slug rasterizer artifacts.
+       For sharp turns, route through the center vertex as before. */
+    float dx = inx - ipx, dy = iny - ipy;
+    if (dx * dx + dy * dy < 1.0f) {
+        /* Points are within ~1 unit — nearly collinear, skip vertex */
+        sigil__curve_array_push(arr, sigil__line_to_quad(ipx, ipy, inx, iny));
+    } else {
+        /* Sharp turn — route through vertex */
+        sigil__curve_array_push(arr, sigil__line_to_quad(ipx, ipy, vx, vy));
+        sigil__curve_array_push(arr, sigil__line_to_quad(vx, vy, inx, iny));
+    }
 }
 
 /* ================================================================== */
@@ -2195,6 +2205,116 @@ static int sigil__apply_dash(SigilCurve *curves, int count,
 
     *out = result.data;
     return result.count;
+}
+
+/* Offset a smooth closed path of quadratic Bezier curves by directly
+   offsetting control points along curve normals.  Produces clean ring
+   geometry without the polyline flattening artifacts that plague
+   sigil__stroke_to_fill on smooth curves like circles and ellipses.
+   Returns 0 if the path is not a suitable candidate (caller should
+   fall back to sigil__stroke_to_fill). */
+static int sigil__stroke_smooth_closed(SigilCurve *curves, int count,
+                                        float stroke_width,
+                                        SigilCurve **out, SigilBounds *bounds) {
+    if (count < 3) return 0; /* need at least 3 curves for a closed shape */
+    float half = stroke_width * 0.5f;
+
+    /* Check: single closed subpath with smooth curve connections */
+    for (int i = 0; i < count; i++) {
+        int next = (i + 1) % count;
+        float dx = curves[next].p0x - curves[i].p2x;
+        float dy = curves[next].p0y - curves[i].p2y;
+        if (dx * dx + dy * dy > 1e-4f) return 0; /* not closed/continuous */
+
+        /* Check curve is a proper quadratic (not a line segment).
+           sigil__line_to_quad offsets the midpoint by 0.05 perpendicular,
+           so line segments have deviation ≈ 0.0025. Reject those. */
+        float mx = (curves[i].p0x + curves[i].p2x) * 0.5f;
+        float my = (curves[i].p0y + curves[i].p2y) * 0.5f;
+        float ddx = curves[i].p1x - mx;
+        float ddy = curves[i].p1y - my;
+        if (ddx * ddx + ddy * ddy < 0.01f) return 0; /* line segment */
+    }
+
+    SigilCurveArray arr;
+    sigil__curve_array_init(&arr);
+
+    /* Forward contour: offset each curve outward (+normal) */
+    for (int i = 0; i < count; i++) {
+        float t0x = curves[i].p1x - curves[i].p0x;
+        float t0y = curves[i].p1y - curves[i].p0y;
+        float t1x = curves[i].p2x - curves[i].p1x;
+        float t1y = curves[i].p2y - curves[i].p1y;
+
+        float len0 = sqrtf(t0x*t0x + t0y*t0y);
+        float len1 = sqrtf(t1x*t1x + t1y*t1y);
+        if (len0 < 1e-12f) len0 = 1e-12f;
+        if (len1 < 1e-12f) len1 = 1e-12f;
+
+        float n0x = -t0y / len0, n0y = t0x / len0;
+        float n1x = -t1y / len1, n1y = t1x / len1;
+        /* Average normal at control point */
+        float nmx = n0x + n1x, nmy = n0y + n1y;
+        float nml = sqrtf(nmx*nmx + nmy*nmy);
+        if (nml < 1e-12f) { nmx = n0x; nmy = n0y; }
+        else { nmx /= nml; nmy /= nml; }
+
+        SigilCurve c;
+        c.p0x = curves[i].p0x + n0x * half;
+        c.p0y = curves[i].p0y + n0y * half;
+        c.p1x = curves[i].p1x + nmx * half;
+        c.p1y = curves[i].p1y + nmy * half;
+        c.p2x = curves[i].p2x + n1x * half;
+        c.p2y = curves[i].p2y + n1y * half;
+        sigil__curve_array_push(&arr, c);
+    }
+
+    /* Backward contour: offset each curve inward (-normal), reversed */
+    for (int i = count - 1; i >= 0; i--) {
+        float t0x = curves[i].p1x - curves[i].p0x;
+        float t0y = curves[i].p1y - curves[i].p0y;
+        float t1x = curves[i].p2x - curves[i].p1x;
+        float t1y = curves[i].p2y - curves[i].p1y;
+
+        float len0 = sqrtf(t0x*t0x + t0y*t0y);
+        float len1 = sqrtf(t1x*t1x + t1y*t1y);
+        if (len0 < 1e-12f) len0 = 1e-12f;
+        if (len1 < 1e-12f) len1 = 1e-12f;
+
+        float n0x = -t0y / len0, n0y = t0x / len0;
+        float n1x = -t1y / len1, n1y = t1x / len1;
+        float nmx = n0x + n1x, nmy = n0y + n1y;
+        float nml = sqrtf(nmx*nmx + nmy*nmy);
+        if (nml < 1e-12f) { nmx = n0x; nmy = n0y; }
+        else { nmx /= nml; nmy /= nml; }
+
+        /* Reversed curve: swap p0/p2 and negate offset */
+        SigilCurve c;
+        c.p0x = curves[i].p2x - n1x * half;
+        c.p0y = curves[i].p2y - n1y * half;
+        c.p1x = curves[i].p1x - nmx * half;
+        c.p1y = curves[i].p1y - nmy * half;
+        c.p2x = curves[i].p0x - n0x * half;
+        c.p2y = curves[i].p0y - n0y * half;
+        sigil__curve_array_push(&arr, c);
+    }
+
+    /* Compute bounds */
+    bounds->xMin = FLT_MAX; bounds->yMin = FLT_MAX;
+    bounds->xMax = -FLT_MAX; bounds->yMax = -FLT_MAX;
+    for (int i = 0; i < arr.count; i++) {
+        float xs[3] = { arr.data[i].p0x, arr.data[i].p1x, arr.data[i].p2x };
+        float ys[3] = { arr.data[i].p0y, arr.data[i].p1y, arr.data[i].p2y };
+        for (int j = 0; j < 3; j++) {
+            if (xs[j] < bounds->xMin) bounds->xMin = xs[j];
+            if (xs[j] > bounds->xMax) bounds->xMax = xs[j];
+            if (ys[j] < bounds->yMin) bounds->yMin = ys[j];
+            if (ys[j] > bounds->yMax) bounds->yMax = ys[j];
+        }
+    }
+
+    *out = arr.data;
+    return arr.count;
 }
 
 static int sigil__stroke_to_fill(SigilCurve *curves, int count,
@@ -2394,7 +2514,7 @@ static int sigil__stroke_to_fill(SigilCurve *curves, int count,
                                      seg_nx[s], seg_ny[s],
                                      half, miter_limit, 0);
                 } else if (cross < -1e-6f) {
-                    /* Right turn: right side is inner — route through vertex */
+                    /* Right turn: right side is inner */
                     float ipx = pts[i0*2] - seg_nx[s_prev] * half;
                     float ipy = pts[i0*2+1] - seg_ny[s_prev] * half;
                     float inx = pts[i0*2] - seg_nx[s] * half;
@@ -4211,9 +4331,16 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             int stroke_src_count = (dashed_count > 0) ? dashed_count : curve_count;
             SigilCurve *stroke_curves = NULL;
             SigilBounds stroke_bounds;
-            int sc = sigil__stroke_to_fill(stroke_src, stroke_src_count, stroke_width,
+            /* Try smooth offset first (for circles, ellipses, etc.) */
+            int sc = sigil__stroke_smooth_closed(stroke_src, stroke_src_count,
+                                                  stroke_width,
+                                                  &stroke_curves, &stroke_bounds);
+            if (sc == 0) {
+                /* Fall back to polyline-based stroke expansion */
+                sc = sigil__stroke_to_fill(stroke_src, stroke_src_count, stroke_width,
                                             line_join, line_cap, miter_limit,
                                             &stroke_curves, &stroke_bounds);
+            }
             free(curves);
             if (dashed_curves) { free(dashed_curves); dashed_curves = NULL; }
             curves = stroke_curves;
@@ -4972,7 +5099,7 @@ SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
     if (vertexBufSize < 4) vertexBufSize = 4;
     gs->vertexBuf = wgpuDeviceCreateBuffer(device,
         &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+            .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
             .size = vertexBufSize
         });
 
@@ -4981,7 +5108,7 @@ SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
     if (indexBufSize < 4) indexBufSize = 4;
     gs->indexBuf = wgpuDeviceCreateBuffer(device,
         &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst,
+            .usage = WGPUBufferUsage_Index | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
             .size = indexBufSize
         });
 
