@@ -3,23 +3,25 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <setjmp.h>
 
-static int g_pass = 0, g_fail = 0;
+/* Longjmp-based harness: test functions are extern and invoked via
+   sigil_run_test() from a gtest C++ wrapper. */
+static jmp_buf g_jmpbuf;
 
-#define TEST(name) static void name(void)
+int sigil_run_test(void (*fn)(void)) {
+    if (setjmp(g_jmpbuf) == 0) { fn(); return 0; }
+    return 1;
+}
+
+#define TEST(name) void name(void)
 #define ASSERT(cond) do { \
     if (!(cond)) { \
         fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        g_fail++; return; \
+        longjmp(g_jmpbuf, 1); \
     } \
 } while(0)
 #define ASSERT_NEAR(a, b, eps) ASSERT(fabsf((float)(a)-(float)(b)) < (eps))
-#define RUN(name) do { \
-    int _prev_fail = g_fail; \
-    printf("  %s...", #name); name(); \
-    if (g_fail == _prev_fail) { printf(" ok\n"); g_pass++; } \
-    else { printf(" FAILED\n"); } \
-} while(0)
 
 /* ================================================================== */
 /*  Path parser tests                                                 */
@@ -465,49 +467,3 @@ TEST(test_parse_svg_text) {
     sigil_free_scene(scene);
 }
 
-/* ================================================================== */
-/*  Main                                                              */
-/* ================================================================== */
-
-int main(void) {
-    printf("SigilVG parser tests:\n");
-
-    printf("\n-- Path parser --\n");
-    RUN(test_parse_moveto_lineto);
-    RUN(test_parse_relative_lineto);
-    RUN(test_parse_hv_lines);
-    RUN(test_parse_cubic);
-    RUN(test_parse_quadratic);
-    RUN(test_parse_smooth_cubic);
-    RUN(test_parse_arc);
-    RUN(test_parse_comma_separated);
-
-    printf("\n-- SVG parsing --\n");
-    RUN(test_parse_svg_rect);
-    RUN(test_parse_svg_circle);
-    RUN(test_parse_svg_path);
-    RUN(test_parse_svg_group_transform);
-    RUN(test_parse_svg_multiple_elements);
-    RUN(test_parse_svg_ellipse);
-    RUN(test_parse_svg_polyline);
-    RUN(test_parse_color_names);
-    RUN(test_parse_fill_rule);
-    RUN(test_stroke_generates_fill);
-
-    printf("\n-- Stroke join/cap tests --\n");
-    RUN(test_stroke_miter_join);
-    RUN(test_stroke_bevel_join);
-    RUN(test_stroke_round_join);
-    RUN(test_stroke_square_cap);
-    RUN(test_stroke_round_cap);
-    RUN(test_stroke_group_inherit_linejoin);
-    RUN(test_stroke_closed_path);
-    RUN(test_stroke_miter_limit);
-
-    printf("\n-- Integration tests --\n");
-    RUN(test_integration_multi_element);
-    RUN(test_parse_svg_text);
-
-    printf("\n%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail > 0 ? 1 : 0;
-}

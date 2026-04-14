@@ -84,6 +84,27 @@ int sigil_load_font(SigilScene *scene, const char *family_name,
 
 #ifdef SIGIL_IMPLEMENTATION
 
+#ifdef __cplusplus
+extern "C" {
+/* Descriptors are passed by pointer to WGPU create-calls that copy immediately,
+ * so the C99 compound-literal idiom `&(T){...}` is safe even though its
+ * temporary dies at end-of-expression in C++. Likewise, designated
+ * initializers out of order were legal in C99 but not C++20. */
+#  if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Waddress-of-temporary"
+#    pragma clang diagnostic ignored "-Wc99-designator"
+#    pragma clang diagnostic ignored "-Wreorder-init-list"
+#    pragma clang diagnostic ignored "-Winitializer-overrides"
+#    pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
+#  elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wpedantic"
+#    pragma GCC diagnostic ignored "-Wnarrowing"
+#    pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#  endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3509,7 +3530,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 const char *use_style;
                 int usl = sigil__get_attr(tag.attrs, tag.attrs_len, "style", &use_style);
                 int udl = sigil__get_prop(tag.attrs, tag.attrs_len, use_style, usl, "display", &use_disp);
-                if (udl == 4 && memcmp(use_disp, "none", 4) == 0) goto next_tag;
+                if (udl == 4 && memcmp(use_disp, "none", 4) == 0) continue;
             }
 
             const char *href_val;
@@ -3842,6 +3863,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             if (dvlen == 6 && memcmp(dv, "hidden", 6) == 0) { free(curves); continue; }
             if (dvlen == 8 && memcmp(dv, "collapse", 8) == 0) { free(curves); continue; }
             /* Inherit visibility from parent groups */
+            int inherited_hidden = 0;
             if (dvlen == 0) {
                 for (int gi = xform_depth; gi >= 0; gi--) {
                     if (!g_style_stack[gi]) continue;
@@ -3849,11 +3871,12 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                     if (dvlen > 0) {
                         if ((dvlen == 6 && memcmp(dv, "hidden", 6) == 0) ||
                             (dvlen == 8 && memcmp(dv, "collapse", 8) == 0))
-                        { free(curves); goto next_tag; }
+                        { inherited_hidden = 1; }
                         break;
                     }
                 }
             }
+            if (inherited_hidden) { free(curves); continue; }
         }
 
         /* Resolve currentColor: look at element's "color" prop, then parent groups */
@@ -3901,10 +3924,10 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         /* Try resolving url(#id) with fallback color */
         if (fill_vlen > 4 && memcmp(fill_val, "url(", 4) == 0) {
             has_fill = 0;
-            const char *hash = memchr(fill_val, '#', (size_t)fill_vlen);
+            const char *hash = (const char*)memchr(fill_val, '#', (size_t)fill_vlen);
             if (hash && grad_defs.count > 0) {
                 hash++;
-                const char *end_paren = memchr(hash, ')', (size_t)(fill_vlen - (int)(hash - fill_val)));
+                const char *end_paren = (const char*)memchr(hash, ')', (size_t)(fill_vlen - (int)(hash - fill_val)));
                 int id_len = end_paren ? (int)(end_paren - hash) : (int)(fill_vlen - (int)(hash - fill_val));
                 /* Trim whitespace and optional quotes from id */
                 while (id_len > 0 && isspace((unsigned char)hash[id_len-1])) id_len--;
@@ -3924,7 +3947,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             }
             /* Fallback color after closing paren: "url(#id) green" */
             if (!has_fill) {
-                const char *cp = memchr(fill_val, ')', (size_t)fill_vlen);
+                const char *cp = (const char*)memchr(fill_val, ')', (size_t)fill_vlen);
                 if (cp) {
                     cp++;
                     int rem = fill_vlen - (int)(cp - fill_val);
@@ -4009,10 +4032,10 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
         if (stroke_vlen > 4 && memcmp(stroke_val, "url(", 4) == 0) {
             /* Stroke gradient */
             has_stroke = 0;
-            const char *hash = memchr(stroke_val, '#', (size_t)stroke_vlen);
+            const char *hash = (const char*)memchr(stroke_val, '#', (size_t)stroke_vlen);
             if (hash && grad_defs.count > 0) {
                 hash++;
-                const char *end_paren = memchr(hash, ')', (size_t)(stroke_vlen - (int)(hash - stroke_val)));
+                const char *end_paren = (const char*)memchr(hash, ')', (size_t)(stroke_vlen - (int)(hash - stroke_val)));
                 int sid_len = end_paren ? (int)(end_paren - hash) : (int)(stroke_vlen - (int)(hash - stroke_val));
                 while (sid_len > 0 && isspace((unsigned char)hash[sid_len-1])) sid_len--;
                 for (int gi = 0; gi < grad_defs.count; gi++) {
@@ -4029,7 +4052,7 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
             }
             /* Fallback color after url() */
             if (!has_stroke) {
-                const char *cp = memchr(stroke_val, ')', (size_t)stroke_vlen);
+                const char *cp = (const char*)memchr(stroke_val, ')', (size_t)stroke_vlen);
                 if (cp) {
                     cp++;
                     int rem = stroke_vlen - (int)(cp - stroke_val);
@@ -4417,7 +4440,6 @@ SigilScene* sigil_parse_svg(const char* svg_data, size_t len) {
                 }
             }
         }
-    next_tag:;
     }
 
     scene->elements = elems.data;
@@ -4496,7 +4518,8 @@ static void sigil__sort_band(SigilBandEntry *band, SigilCurve *curves, int axis)
         float mx = axis == 0
             ? fmaxf(fmaxf(c->p0x, c->p1x), c->p2x)
             : fmaxf(fmaxf(c->p0y, c->p1y), c->p2y);
-        e[i] = (SigilSortEntry){band->curveIndices[i], mx};
+        SigilSortEntry entry = {band->curveIndices[i], mx};
+        e[i] = entry;
     }
     qsort(e, (size_t)n, sizeof *e, sigil__cmp_desc);
     for (int i = 0; i < n; i++) band->curveIndices[i] = e[i].idx;
@@ -4521,7 +4544,11 @@ static char* sigil__read_file(const char *path) {
 }
 
 #ifndef STRVIEW
+#ifdef __cplusplus
+#define STRVIEW(X) WGPUStringView{X, sizeof(X) - 1}
+#else
 #define STRVIEW(X) (WGPUStringView){X, sizeof(X) - 1}
+#endif
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4570,55 +4597,55 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
 
     /* Create shader modules */
     WGPUShaderSourceWGSL vsWgsl = {
-        .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+        .chain = {.sType = WGPUSType_ShaderSourceWGSL, .next = NULL},
         .code = {.data = vsSrc, .length = WGPU_STRLEN}
     };
-    ctx->vertexShader = wgpuDeviceCreateShaderModule(device,
-        &(WGPUShaderModuleDescriptor){.nextInChain = &vsWgsl.chain});
+    WGPUShaderModuleDescriptor vsModDesc = {.nextInChain = &vsWgsl.chain, .label = {NULL, WGPU_STRLEN}};
+    ctx->vertexShader = wgpuDeviceCreateShaderModule(device, &vsModDesc);
 
     WGPUShaderSourceWGSL fsWgsl = {
-        .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+        .chain = {.sType = WGPUSType_ShaderSourceWGSL, .next = NULL},
         .code = {.data = fsSrc, .length = WGPU_STRLEN}
     };
-    ctx->fragmentShader = wgpuDeviceCreateShaderModule(device,
-        &(WGPUShaderModuleDescriptor){.nextInChain = &fsWgsl.chain});
+    WGPUShaderModuleDescriptor fsModDesc = {.nextInChain = &fsWgsl.chain, .label = {NULL, WGPU_STRLEN}};
+    ctx->fragmentShader = wgpuDeviceCreateShaderModule(device, &fsModDesc);
 
     free(vsSrc); free(fsSrc);
 
     /* Bind group layout: uniform + curve SSBO + band SSBO + gradient texture + sampler */
     WGPUBindGroupLayoutEntry bglEntries[5] = {
         { .binding = 0, .visibility = WGPUShaderStage_Vertex,
-          .buffer = {.type = WGPUBufferBindingType_Uniform} },
+          .buffer = {.type = WGPUBufferBindingType_Uniform, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 1, .visibility = WGPUShaderStage_Fragment,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 2, .visibility = WGPUShaderStage_Fragment,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 3, .visibility = WGPUShaderStage_Fragment,
           .texture = {.sampleType = WGPUTextureSampleType_Float,
-                      .viewDimension = WGPUTextureViewDimension_2D} },
+                      .viewDimension = WGPUTextureViewDimension_2D, .nextInChain = NULL, .multisampled = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 4, .visibility = WGPUShaderStage_Fragment,
-          .sampler = {.type = WGPUSamplerBindingType_Filtering} },
+          .sampler = {.type = WGPUSamplerBindingType_Filtering, .nextInChain = NULL} , .nextInChain = NULL, .bindingArraySize = 0},
     };
-    ctx->renderBGL = wgpuDeviceCreateBindGroupLayout(device,
-        &(WGPUBindGroupLayoutDescriptor){.entryCount = 5, .entries = bglEntries});
-    ctx->renderPipelineLayout = wgpuDeviceCreatePipelineLayout(device,
-        &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 1,
-            .bindGroupLayouts = &ctx->renderBGL});
+    WGPUBindGroupLayoutDescriptor renderBGLDesc = {.entryCount = 5, .entries = bglEntries, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->renderBGL = wgpuDeviceCreateBindGroupLayout(device, &renderBGLDesc);
+    WGPUPipelineLayoutDescriptor renderPLDesc = {.bindGroupLayoutCount = 1,
+        .bindGroupLayouts = &ctx->renderBGL, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->renderPipelineLayout = wgpuDeviceCreatePipelineLayout(device, &renderPLDesc);
 
     /* Vertex attributes: 7 x Float32x4, stride = 112 */
     WGPUVertexAttribute vAttrs[7] = {
-        {.shaderLocation = 0, .offset =  0, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 1, .offset = 16, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 2, .offset = 32, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 3, .offset = 48, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 4, .offset = 64, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 5, .offset = 80, .format = WGPUVertexFormat_Float32x4},
-        {.shaderLocation = 6, .offset = 96, .format = WGPUVertexFormat_Float32x4},
+        {.shaderLocation = 0, .offset =  0, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 1, .offset = 16, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 2, .offset = 32, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 3, .offset = 48, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 4, .offset = 64, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 5, .offset = 80, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
+        {.shaderLocation = 6, .offset = 96, .format = WGPUVertexFormat_Float32x4, .nextInChain = NULL},
     };
     WGPUVertexBufferLayout vbLayout = {
         .arrayStride = 112, .attributeCount = 7,
         .attributes = vAttrs, .stepMode = WGPUVertexStepMode_Vertex
-    };
+    , .nextInChain = NULL};
 
     /* Premultiplied alpha blending */
     WGPUBlendState blend = {
@@ -4633,25 +4660,25 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
         .format = colorFormat,
         .blend = &blend,
         .writeMask = WGPUColorWriteMask_All
-    };
+    , .nextInChain = NULL};
     WGPUFragmentState fs = {
         .module = ctx->fragmentShader, .entryPoint = STRVIEW("main"),
         .targetCount = 1, .targets = &cts
-    };
+    , .nextInChain = NULL, .constantCount = 0, .constants = NULL};
 
     WGPURenderPipelineDescriptor rpDesc = {
         .layout = ctx->renderPipelineLayout,
         .vertex = {
             .module = ctx->vertexShader, .entryPoint = STRVIEW("main"),
             .bufferCount = 1, .buffers = &vbLayout
-        },
+        , .nextInChain = NULL, .constantCount = 0, .constants = NULL},
         .fragment = &fs,
         .primitive = {
             .topology = WGPUPrimitiveTopology_TriangleList,
             .cullMode = WGPUCullMode_None
-        },
-        .multisample = {.count = 1, .mask = 0xFFFFFFFF},
-    };
+        , .nextInChain = NULL},
+        .multisample = {.count = 1, .mask = 0xFFFFFFFF, .nextInChain = NULL},
+     .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
 
     /* Optional depth stencil */
     WGPUDepthStencilState dsState;
@@ -4666,65 +4693,65 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
     ctx->pipeline = wgpuDeviceCreateRenderPipeline(device, &rpDesc);
 
     /* ---- Gradient sampler (shared by render + gradient compute) ---- */
-    ctx->gradientSampler = wgpuDeviceCreateSampler(device,
-        &(WGPUSamplerDescriptor){
-            .magFilter = WGPUFilterMode_Linear,
-            .minFilter = WGPUFilterMode_Linear,
-            .addressModeU = WGPUAddressMode_ClampToEdge,
-            .addressModeV = WGPUAddressMode_ClampToEdge,
-            .addressModeW = WGPUAddressMode_ClampToEdge,
-        });
+    WGPUSamplerDescriptor gradSamplerDesc = {
+        .magFilter = WGPUFilterMode_Linear,
+        .minFilter = WGPUFilterMode_Linear,
+        .addressModeU = WGPUAddressMode_ClampToEdge,
+        .addressModeV = WGPUAddressMode_ClampToEdge,
+        .addressModeW = WGPUAddressMode_ClampToEdge,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->gradientSampler = wgpuDeviceCreateSampler(device, &gradSamplerDesc);
 
     /* ---- Prepare compute: bind group layouts ---- */
     /* group(0): scene data inputs (read-only) */
     WGPUBindGroupLayoutEntry prepInEntries[5] = {
         { .binding = 0, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 1, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 2, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 3, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 4, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Uniform} },
+          .buffer = {.type = WGPUBufferBindingType_Uniform, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
     };
-    ctx->prepareInputBGL = wgpuDeviceCreateBindGroupLayout(device,
-        &(WGPUBindGroupLayoutDescriptor){.entryCount = 5, .entries = prepInEntries});
+    WGPUBindGroupLayoutDescriptor prepInBGLDesc = {.entryCount = 5, .entries = prepInEntries, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->prepareInputBGL = wgpuDeviceCreateBindGroupLayout(device, &prepInBGLDesc);
 
     /* group(1): output buffers (read-write) */
     WGPUBindGroupLayoutEntry prepOutEntries[4] = {
         { .binding = 0, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Storage} },
+          .buffer = {.type = WGPUBufferBindingType_Storage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 1, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Storage} },
+          .buffer = {.type = WGPUBufferBindingType_Storage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 2, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Storage} },
+          .buffer = {.type = WGPUBufferBindingType_Storage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 3, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Storage} },
+          .buffer = {.type = WGPUBufferBindingType_Storage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
     };
-    ctx->prepareOutputBGL = wgpuDeviceCreateBindGroupLayout(device,
-        &(WGPUBindGroupLayoutDescriptor){.entryCount = 4, .entries = prepOutEntries});
+    WGPUBindGroupLayoutDescriptor prepOutBGLDesc = {.entryCount = 4, .entries = prepOutEntries, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->prepareOutputBGL = wgpuDeviceCreateBindGroupLayout(device, &prepOutBGLDesc);
 
     WGPUBindGroupLayout prepareBGLs[2] = { ctx->prepareInputBGL, ctx->prepareOutputBGL };
-    ctx->preparePipelineLayout = wgpuDeviceCreatePipelineLayout(device,
-        &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 2,
-            .bindGroupLayouts = prepareBGLs});
+    WGPUPipelineLayoutDescriptor preparePLDesc = {.bindGroupLayoutCount = 2,
+        .bindGroupLayouts = prepareBGLs, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->preparePipelineLayout = wgpuDeviceCreatePipelineLayout(device, &preparePLDesc);
 
     /* ---- Gradient compute: bind group layout ---- */
     WGPUBindGroupLayoutEntry gradEntries[3] = {
         { .binding = 0, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 1, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage} },
+          .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
         { .binding = 2, .visibility = WGPUShaderStage_Compute,
-          .buffer = {.type = WGPUBufferBindingType_Storage} },
+          .buffer = {.type = WGPUBufferBindingType_Storage, .nextInChain = NULL, .hasDynamicOffset = 0} , .nextInChain = NULL, .bindingArraySize = 0},
     };
-    ctx->gradientBGL = wgpuDeviceCreateBindGroupLayout(device,
-        &(WGPUBindGroupLayoutDescriptor){.entryCount = 3, .entries = gradEntries});
-    ctx->gradientPipelineLayout = wgpuDeviceCreatePipelineLayout(device,
-        &(WGPUPipelineLayoutDescriptor){.bindGroupLayoutCount = 1,
-            .bindGroupLayouts = &ctx->gradientBGL});
+    WGPUBindGroupLayoutDescriptor gradBGLDesc = {.entryCount = 3, .entries = gradEntries, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->gradientBGL = wgpuDeviceCreateBindGroupLayout(device, &gradBGLDesc);
+    WGPUPipelineLayoutDescriptor gradPLDesc = {.bindGroupLayoutCount = 1,
+        .bindGroupLayouts = &ctx->gradientBGL, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    ctx->gradientPipelineLayout = wgpuDeviceCreatePipelineLayout(device, &gradPLDesc);
 
     /* ---- Load compute shaders ---- */
     char csPreparePath[1024], csGradPath[1024];
@@ -4755,32 +4782,32 @@ SigilContext* sigil_create(WGPUDevice device, WGPUTextureFormat colorFormat,
         /* Non-fatal for now: leave compute pipelines NULL */
     } else {
         WGPUShaderSourceWGSL csPreWgsl = {
-            .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+            .chain = {.sType = WGPUSType_ShaderSourceWGSL, .next = NULL},
             .code = {.data = csPrepareSrc, .length = WGPU_STRLEN}
         };
-        ctx->prepareShader = wgpuDeviceCreateShaderModule(device,
-            &(WGPUShaderModuleDescriptor){.nextInChain = &csPreWgsl.chain});
+        WGPUShaderModuleDescriptor csPreModDesc = {.nextInChain = &csPreWgsl.chain, .label = {NULL, WGPU_STRLEN}};
+        ctx->prepareShader = wgpuDeviceCreateShaderModule(device, &csPreModDesc);
 
         WGPUShaderSourceWGSL csGradWgsl = {
-            .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+            .chain = {.sType = WGPUSType_ShaderSourceWGSL, .next = NULL},
             .code = {.data = csGradSrc, .length = WGPU_STRLEN}
         };
-        ctx->gradientShader = wgpuDeviceCreateShaderModule(device,
-            &(WGPUShaderModuleDescriptor){.nextInChain = &csGradWgsl.chain});
+        WGPUShaderModuleDescriptor csGradModDesc = {.nextInChain = &csGradWgsl.chain, .label = {NULL, WGPU_STRLEN}};
+        ctx->gradientShader = wgpuDeviceCreateShaderModule(device, &csGradModDesc);
 
         free(csPrepareSrc); free(csGradSrc);
 
         /* Create compute pipelines */
-        ctx->preparePipeline = wgpuDeviceCreateComputePipeline(device,
-            &(WGPUComputePipelineDescriptor){
-                .layout = ctx->preparePipelineLayout,
-                .compute = {.module = ctx->prepareShader, .entryPoint = STRVIEW("main")}
-            });
-        ctx->gradientPipeline = wgpuDeviceCreateComputePipeline(device,
-            &(WGPUComputePipelineDescriptor){
-                .layout = ctx->gradientPipelineLayout,
-                .compute = {.module = ctx->gradientShader, .entryPoint = STRVIEW("main")}
-            });
+        WGPUComputePipelineDescriptor prepCPDesc = {
+            .layout = ctx->preparePipelineLayout,
+            .compute = {.module = ctx->prepareShader, .entryPoint = STRVIEW("main"), .nextInChain = NULL, .constantCount = 0, .constants = NULL},
+            .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+        ctx->preparePipeline = wgpuDeviceCreateComputePipeline(device, &prepCPDesc);
+        WGPUComputePipelineDescriptor gradCPDesc = {
+            .layout = ctx->gradientPipelineLayout,
+            .compute = {.module = ctx->gradientShader, .entryPoint = STRVIEW("main"), .nextInChain = NULL, .constantCount = 0, .constants = NULL},
+            .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+        ctx->gradientPipeline = wgpuDeviceCreateComputePipeline(device, &gradCPDesc);
     }
 
     return ctx;
@@ -5025,161 +5052,150 @@ SigilGPUScene* sigil_upload(SigilContext* ctx, SigilScene* scene) {
     /* ---- Create and upload input buffers ---- */
 
     /* Curves buffer */
-    gs->curvesBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = curvesBytes
-        });
+    WGPUBufferDescriptor curvesBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = curvesBytes, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->curvesBuf = wgpuDeviceCreateBuffer(device, &curvesBufDesc);
     wgpuQueueWriteBuffer(queue, gs->curvesBuf, 0, curvesData, curvesBytes);
 
     /* Elements buffer */
-    gs->elementsBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = elemBytes
-        });
+    WGPUBufferDescriptor elementsBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = elemBytes, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->elementsBuf = wgpuDeviceCreateBuffer(device, &elementsBufDesc);
     wgpuQueueWriteBuffer(queue, gs->elementsBuf, 0, elemData, elemBytes);
 
     /* Offsets buffer */
-    gs->offsetsBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = offsetsBytes
-        });
+    WGPUBufferDescriptor offsetsBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = offsetsBytes, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->offsetsBuf = wgpuDeviceCreateBuffer(device, &offsetsBufDesc);
     wgpuQueueWriteBuffer(queue, gs->offsetsBuf, 0, offsetData, offsetsBytes);
 
     /* Gradients buffer */
-    gs->gradientsBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = gradBufBytes
-        });
+    WGPUBufferDescriptor gradientsBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = gradBufBytes, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->gradientsBuf = wgpuDeviceCreateBuffer(device, &gradientsBufDesc);
     if (gradBufData) {
         wgpuQueueWriteBuffer(queue, gs->gradientsBuf, 0, gradBufData, gradBufBytes);
     }
 
     /* Gradient stops buffer */
-    gs->gradientStopsBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = stopBufBytes
-        });
+    WGPUBufferDescriptor gradStopsBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = stopBufBytes, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->gradientStopsBuf = wgpuDeviceCreateBuffer(device, &gradStopsBufDesc);
     if (stopBufData) {
         wgpuQueueWriteBuffer(queue, gs->gradientStopsBuf, 0, stopBufData, stopBufBytes);
     }
 
     /* Viewport uniform buffer (32 bytes = 8 floats, written per-prepare) */
-    gs->viewportBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-            .size = 32
-        });
+    WGPUBufferDescriptor viewportBufDesc = {
+        .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+        .size = 32, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->viewportBuf = wgpuDeviceCreateBuffer(device, &viewportBufDesc);
 
     /* ---- Create output buffers ---- */
     /* All output buffers get CopyDst for CPU fallback path */
 
     /* curveBuf: curveOutVec4s * 16 bytes */
     uint64_t curveBufSize = curveOutVec4s > 0 ? (uint64_t)curveOutVec4s * 16 : 4;
-    gs->curveBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = curveBufSize
-        });
+    WGPUBufferDescriptor curveBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = curveBufSize, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->curveBuf = wgpuDeviceCreateBuffer(device, &curveBufDesc);
 
     /* bandBuf: bandOutVec4s * 16 bytes */
     uint64_t bandBufSize = bandOutVec4s > 0 ? (uint64_t)bandOutVec4s * 16 : 4;
-    gs->bandBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = bandBufSize
-        });
+    WGPUBufferDescriptor bandBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = bandBufSize, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->bandBuf = wgpuDeviceCreateBuffer(device, &bandBufDesc);
 
     /* vertexBuf: ec * 4 * 112 bytes (Vertex + CopyDst) */
     uint64_t vertexBufSize = (uint64_t)ec * 4 * 112;
     if (vertexBufSize < 4) vertexBufSize = 4;
-    gs->vertexBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
-            .size = vertexBufSize
-        });
+    WGPUBufferDescriptor vertexBufDesc = {
+        .usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc,
+        .size = vertexBufSize, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->vertexBuf = wgpuDeviceCreateBuffer(device, &vertexBufDesc);
 
     /* indexBuf: ec * 6 * 4 bytes (Index + CopyDst) */
     uint64_t indexBufSize = (uint64_t)ec * 6 * 4;
     if (indexBufSize < 4) indexBufSize = 4;
-    gs->indexBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Index | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-            .size = indexBufSize
-        });
+    WGPUBufferDescriptor indexBufDesc = {
+        .usage = WGPUBufferUsage_Index | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        .size = indexBufSize, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->indexBuf = wgpuDeviceCreateBuffer(device, &indexBufDesc);
 
     /* gradientRampBuf: gradTexH * 256 * 4 bytes (Storage + CopySrc) */
     uint64_t rampBufSize = (uint64_t)gradTexH * 256 * 4;
     if (rampBufSize < 4) rampBufSize = 4;
-    gs->gradientRampBuf = wgpuDeviceCreateBuffer(device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
-            .size = rampBufSize
-        });
+    WGPUBufferDescriptor gradRampBufDesc = {
+        .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
+        .size = rampBufSize, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->gradientRampBuf = wgpuDeviceCreateBuffer(device, &gradRampBufDesc);
 
     /* ---- Gradient ramp texture: RGBA8Unorm, 256 x gradTexH ---- */
-    gs->gradientTexture = wgpuDeviceCreateTexture(device,
-        &(WGPUTextureDescriptor){
-            .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-            .size = {(uint32_t)SIGIL_GRADIENT_RAMP_WIDTH, (uint32_t)gradTexH, 1},
-            .format = WGPUTextureFormat_RGBA8Unorm,
-            .mipLevelCount = 1, .sampleCount = 1,
-            .dimension = WGPUTextureDimension_2D,
-        });
-    gs->gradientView = wgpuTextureCreateView(gs->gradientTexture,
-        &(WGPUTextureViewDescriptor){
-            .format = WGPUTextureFormat_RGBA8Unorm,
-            .dimension = WGPUTextureViewDimension_2D,
-            .mipLevelCount = 1, .arrayLayerCount = 1,
-            .aspect = WGPUTextureAspect_All,
-            .usage = WGPUTextureUsage_TextureBinding
-        });
+    WGPUTextureDescriptor gradTexDesc = {
+        .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+        .size = {(uint32_t)SIGIL_GRADIENT_RAMP_WIDTH, (uint32_t)gradTexH, 1},
+        .format = WGPUTextureFormat_RGBA8Unorm,
+        .mipLevelCount = 1, .sampleCount = 1,
+        .dimension = WGPUTextureDimension_2D,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->gradientTexture = wgpuDeviceCreateTexture(device, &gradTexDesc);
+    WGPUTextureViewDescriptor gradViewDesc = {
+        .format = WGPUTextureFormat_RGBA8Unorm,
+        .dimension = WGPUTextureViewDimension_2D,
+        .mipLevelCount = 1, .arrayLayerCount = 1,
+        .aspect = WGPUTextureAspect_All,
+        .usage = WGPUTextureUsage_TextureBinding,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->gradientView = wgpuTextureCreateView(gs->gradientTexture, &gradViewDesc);
 
     /* ---- Build compute bind groups ---- */
 
     /* prepareInputBG: group(0) — 5 bindings */
     WGPUBindGroupEntry inputEntries[5] = {
-        {.binding = 0, .buffer = gs->curvesBuf,    .size = curvesBytes},
-        {.binding = 1, .buffer = gs->elementsBuf,  .size = elemBytes},
-        {.binding = 2, .buffer = gs->offsetsBuf,   .size = offsetsBytes},
-        {.binding = 3, .buffer = gs->gradientsBuf, .size = gradBufBytes},
-        {.binding = 4, .buffer = gs->viewportBuf,  .size = 32},
+        {.binding = 0, .buffer = gs->curvesBuf,    .size = curvesBytes, .nextInChain = NULL, .offset = 0},
+        {.binding = 1, .buffer = gs->elementsBuf,  .size = elemBytes, .nextInChain = NULL, .offset = 0},
+        {.binding = 2, .buffer = gs->offsetsBuf,   .size = offsetsBytes, .nextInChain = NULL, .offset = 0},
+        {.binding = 3, .buffer = gs->gradientsBuf, .size = gradBufBytes, .nextInChain = NULL, .offset = 0},
+        {.binding = 4, .buffer = gs->viewportBuf,  .size = 32, .nextInChain = NULL, .offset = 0},
     };
-    gs->prepareInputBG = wgpuDeviceCreateBindGroup(device,
-        &(WGPUBindGroupDescriptor){
-            .layout = ctx->prepareInputBGL,
-            .entryCount = 5, .entries = inputEntries
-        });
+    WGPUBindGroupDescriptor prepInBGDesc = {
+        .layout = ctx->prepareInputBGL,
+        .entryCount = 5, .entries = inputEntries,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->prepareInputBG = wgpuDeviceCreateBindGroup(device, &prepInBGDesc);
 
     /* prepareOutputBG: group(1) — 4 bindings */
     WGPUBindGroupEntry outputEntries[4] = {
-        {.binding = 0, .buffer = gs->curveBuf,  .size = curveBufSize},
-        {.binding = 1, .buffer = gs->bandBuf,   .size = bandBufSize},
-        {.binding = 2, .buffer = gs->vertexBuf, .size = vertexBufSize},
-        {.binding = 3, .buffer = gs->indexBuf,  .size = indexBufSize},
+        {.binding = 0, .buffer = gs->curveBuf,  .size = curveBufSize, .nextInChain = NULL, .offset = 0},
+        {.binding = 1, .buffer = gs->bandBuf,   .size = bandBufSize, .nextInChain = NULL, .offset = 0},
+        {.binding = 2, .buffer = gs->vertexBuf, .size = vertexBufSize, .nextInChain = NULL, .offset = 0},
+        {.binding = 3, .buffer = gs->indexBuf,  .size = indexBufSize, .nextInChain = NULL, .offset = 0},
     };
-    gs->prepareOutputBG = wgpuDeviceCreateBindGroup(device,
-        &(WGPUBindGroupDescriptor){
-            .layout = ctx->prepareOutputBGL,
-            .entryCount = 4, .entries = outputEntries
-        });
+    WGPUBindGroupDescriptor prepOutBGDesc = {
+        .layout = ctx->prepareOutputBGL,
+        .entryCount = 4, .entries = outputEntries,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    gs->prepareOutputBG = wgpuDeviceCreateBindGroup(device, &prepOutBGDesc);
 
     /* gradientBG: group(0) of gradient compute — 3 bindings (NULL if no grads) */
     if (gradCount > 0) {
         WGPUBindGroupEntry gradEntries[3] = {
-            {.binding = 0, .buffer = gs->gradientsBuf,    .size = gradBufBytes},
-            {.binding = 1, .buffer = gs->gradientStopsBuf, .size = stopBufBytes},
-            {.binding = 2, .buffer = gs->gradientRampBuf,  .size = rampBufSize},
+            {.binding = 0, .buffer = gs->gradientsBuf,    .size = gradBufBytes, .nextInChain = NULL, .offset = 0},
+            {.binding = 1, .buffer = gs->gradientStopsBuf, .size = stopBufBytes, .nextInChain = NULL, .offset = 0},
+            {.binding = 2, .buffer = gs->gradientRampBuf,  .size = rampBufSize, .nextInChain = NULL, .offset = 0},
         };
-        gs->gradientBG = wgpuDeviceCreateBindGroup(device,
-            &(WGPUBindGroupDescriptor){
-                .layout = ctx->gradientBGL,
-                .entryCount = 3, .entries = gradEntries
-            });
+        WGPUBindGroupDescriptor gradBGDesc = {
+            .layout = ctx->gradientBGL,
+            .entryCount = 3, .entries = gradEntries,
+            .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+        gs->gradientBG = wgpuDeviceCreateBindGroup(device, &gradBGDesc);
     }
 
     /* ---- Store CPU copies for CPU prepare fallback ---- */
@@ -5576,19 +5592,22 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
         }
 
         /* Upload ramp directly to the gradient texture */
+        WGPUTexelCopyTextureInfo rampCopyTex = {
+            .texture = gs->gradientTexture,
+            .mipLevel = 0,
+            .aspect = WGPUTextureAspect_All,
+            .origin = {0, 0, 0}};
+        WGPUTexelCopyBufferLayout rampCopyLayout = {
+            .bytesPerRow = 256 * 4,
+            .rowsPerImage = gradTexH,
+            .offset = 0};
+        WGPUExtent3D rampCopyExtent = {256, gradTexH, 1};
         wgpuQueueWriteTexture(queue,
-            &(WGPUTexelCopyTextureInfo){
-                .texture = gs->gradientTexture,
-                .mipLevel = 0,
-                .aspect = WGPUTextureAspect_All,
-            },
+            &rampCopyTex,
             rampPixels,
             (size_t)gradTexH * 256 * 4,
-            &(WGPUTexelCopyBufferLayout){
-                .bytesPerRow = 256 * 4,
-                .rowsPerImage = gradTexH,
-            },
-            &(WGPUExtent3D){256, gradTexH, 1}
+            &rampCopyLayout,
+            &rampCopyExtent
         );
         free(rampPixels);
     }
@@ -5602,11 +5621,10 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
     dd->indexBuf   = gs->indexBuf;     /* borrowed, not owned */
 
     /* 80-byte uniform buffer (MVP + viewport size) */
-    dd->uniformBuffer = wgpuDeviceCreateBuffer(ctx->device,
-        &(WGPUBufferDescriptor){
-            .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-            .size  = 80
-        });
+    WGPUBufferDescriptor uboDesc = {
+        .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+        .size  = 80, .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    dd->uniformBuffer = wgpuDeviceCreateBuffer(ctx->device, &uboDesc);
 
     float ubo[20] = {
          2.0f / viewport_w, 0, 0, -1.0f,
@@ -5620,20 +5638,20 @@ SigilDrawData* sigil_prepare_gpu(SigilContext* ctx, SigilGPUScene* gs,
     /* Render bind group: uniform + curveBuf + bandBuf + gradientView + sampler */
     WGPUBindGroupEntry bgEntries[5] = {
         {.binding = 0, .buffer = dd->uniformBuffer,
-         .size = 80},
+         .size = 80, .nextInChain = NULL, .offset = 0},
         {.binding = 1, .buffer = gs->curveBuf,
-         .size = wgpuBufferGetSize(gs->curveBuf)},
+         .size = wgpuBufferGetSize(gs->curveBuf), .nextInChain = NULL, .offset = 0},
         {.binding = 2, .buffer = gs->bandBuf,
-         .size = wgpuBufferGetSize(gs->bandBuf)},
-        {.binding = 3, .textureView = gs->gradientView},
-        {.binding = 4, .sampler = ctx->gradientSampler},
+         .size = wgpuBufferGetSize(gs->bandBuf), .nextInChain = NULL, .offset = 0},
+        {.binding = 3, .textureView = gs->gradientView, .nextInChain = NULL},
+        {.binding = 4, .sampler = ctx->gradientSampler, .nextInChain = NULL},
     };
-    dd->renderBindGroup = wgpuDeviceCreateBindGroup(ctx->device,
-        &(WGPUBindGroupDescriptor){
-            .layout     = ctx->renderBGL,
-            .entryCount = 5,
-            .entries    = bgEntries
-        });
+    WGPUBindGroupDescriptor renderBGDesc = {
+        .layout     = ctx->renderBGL,
+        .entryCount = 5,
+        .entries    = bgEntries,
+        .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
+    dd->renderBindGroup = wgpuDeviceCreateBindGroup(ctx->device, &renderBGDesc);
 
     return dd;
 }
@@ -5651,21 +5669,26 @@ void sigil_encode(SigilContext* ctx, SigilDrawData* data,
                   const float clear_color[4]) {
     if (!ctx || !data || !encoder || !color_target) return;
 
+    WGPUColor caClear;
+    if (clear_color) {
+        caClear.r = clear_color[0]; caClear.g = clear_color[1];
+        caClear.b = clear_color[2]; caClear.a = clear_color[3];
+    } else {
+        caClear.r = 0; caClear.g = 0; caClear.b = 0; caClear.a = 1;
+    }
     WGPURenderPassColorAttachment ca = {
         .view = color_target,
         .loadOp = clear_color ? WGPULoadOp_Clear : WGPULoadOp_Load,
         .storeOp = WGPUStoreOp_Store,
-        .clearValue = clear_color
-            ? (WGPUColor){clear_color[0], clear_color[1], clear_color[2], clear_color[3]}
-            : (WGPUColor){0, 0, 0, 1},
+        .clearValue = caClear,
         .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
-    };
+     .nextInChain = NULL};
 
     WGPURenderPassDepthStencilAttachment dsa;
     WGPURenderPassDescriptor rpDesc = {
         .colorAttachmentCount = 1,
         .colorAttachments = &ca,
-    };
+     .nextInChain = NULL, .label = {NULL, WGPU_STRLEN}};
 
     if (depth_target) {
         memset(&dsa, 0, sizeof dsa);
@@ -5751,6 +5774,15 @@ void sigil_destroy(SigilContext* ctx) {
     if (ctx->gradientSampler)       wgpuSamplerRelease(ctx->gradientSampler);
     free(ctx);
 }
+
+#ifdef __cplusplus
+#  if defined(__clang__)
+#    pragma clang diagnostic pop
+#  elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#  endif
+} /* extern "C" */
+#endif
 
 #endif /* SIGIL_IMPLEMENTATION */
 #endif /* SIGILVG_H */

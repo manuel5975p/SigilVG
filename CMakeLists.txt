@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(sigilvg C)
+project(sigilvg C CXX)
 if(APPLE)
     enable_language(OBJC)
 endif()
@@ -74,12 +74,24 @@ target_link_libraries(sigilvg INTERFACE wgvk)
 target_compile_features(sigilvg INTERFACE c_std_11)
 
 if(NOT EMSCRIPTEN)
-    add_executable(sigilvg_test_parse tests/test_parse.c)
-    target_link_libraries(sigilvg_test_parse PRIVATE sigilvg)
+    # --- GoogleTest ---
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP True
+    )
+    FetchContent_MakeAvailable(googletest)
+
+    add_executable(sigilvg_test_parse tests/test_parse.c tests/test_parse_gtest.cpp)
+    target_link_libraries(sigilvg_test_parse PRIVATE sigilvg GTest::gtest_main)
     target_include_directories(sigilvg_test_parse PRIVATE "${STB_DIR}")
     if(NOT MSVC)
         target_link_libraries(sigilvg_test_parse PRIVATE m)
     endif()
+    include(GoogleTest)
+    gtest_discover_tests(sigilvg_test_parse)
 
     add_executable(sigilvg_headless examples/headless.c)
     target_link_libraries(sigilvg_headless PRIVATE sigilvg)
@@ -135,12 +147,13 @@ if(NOT EMSCRIPTEN)
     set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}" CACHE BOOL "" FORCE)
 
     if(HAVE_PLUTOSVG)
-        add_executable(sigilvg_test_ref tests/test_reference.c)
-        target_link_libraries(sigilvg_test_ref PRIVATE sigilvg plutosvg::plutosvg plutovg::plutovg)
+        add_executable(sigilvg_test_ref tests/test_reference.c tests/test_reference_gtest.cpp)
+        target_link_libraries(sigilvg_test_ref PRIVATE sigilvg plutosvg::plutosvg plutovg::plutovg gtest)
         target_include_directories(sigilvg_test_ref PRIVATE "${STB_DIR}")
         if(NOT MSVC)
             target_link_libraries(sigilvg_test_ref PRIVATE m)
         endif()
+        gtest_discover_tests(sigilvg_test_ref PROPERTIES TIMEOUT 120)
     endif()
 
     add_executable(sigilvg_headless_batch examples/headless_batch.c)

@@ -1,8 +1,9 @@
 /*
  * SigilVG interactive viewer — renders SVG in a GLFW window via WebGPU.
  *
- * Usage: sigilvg_viewer [input.svg]
+ * Usage: sigilvg_viewer [input.svg] [--capture out.png]
  *   If no input SVG given, renders a built-in test scene.
+ *   --capture: render one frame, save to PNG, exit (debug mode).
  *
  * Controls:
  *   Scroll wheel        — zoom (toward cursor)
@@ -15,6 +16,9 @@
 #include "sigilvg.h"
 
 #include "common.h"   /* wgpu_init(), wgpu_base, STRVIEW, nanoTime */
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +52,26 @@ static char *read_file(const char *path, size_t *out_size)
     fclose(f);
     if (out_size) *out_size = rd;
     return buf;
+}
+
+/* Try to load a complex default SVG for benchmarking when no path is given.
+   Returns NULL if none of the candidate paths exist. */
+static char *try_load_default_svg(size_t *out_size, const char **out_path)
+{
+    static const char *candidates[] = {
+        "_deps/plutosvg-src/examples/camera.svg",       /* run from build/ */
+        "build/_deps/plutosvg-src/examples/camera.svg", /* run from project root */
+        "../build/_deps/plutosvg-src/examples/camera.svg",
+        NULL,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        FILE *f = fopen(candidates[i], "rb");
+        if (!f) continue;
+        fclose(f);
+        char *buf = read_file(candidates[i], out_size);
+        if (buf) { *out_path = candidates[i]; return buf; }
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -189,6 +213,13 @@ static void key_cb(GLFWwindow *w, int key, int scancode, int action, int mods)
     if (key == GLFW_KEY_ESCAPE)
         glfwSetWindowShouldClose(w, GLFW_TRUE);
 
+    if (key == GLFW_KEY_P && g_ctx) {
+        int ww, wh;
+        glfwGetWindowSize(w, &ww, &wh);
+        fprintf(stderr, "view: --size %d %d --zoom %.4f --cam %.4f %.4f\n",
+                ww, wh, g_ctx->zoom, g_ctx->cam_x, g_ctx->cam_y);
+    }
+
     if (key == GLFW_KEY_R && g_ctx) {
         int ww, wh;
         glfwGetWindowSize(w, &ww, &wh);
@@ -232,10 +263,48 @@ static void rebuild_draw_data(ViewerCtx *ctx, int width, int height)
 /*  Main loop — one frame                                             */
 /* ------------------------------------------------------------------ */
 
+/* FPS tracker: logs avg / min / max / p99 of the last WINDOW frame times
+   every time the window fills up. Frame time is measured wall-clock
+   end-to-end (poll events → present). */
+#define SIGIL_FPS_WINDOW 120
+static void fps_tick(uint64_t frame_ns)
+{
+    static uint64_t samples[SIGIL_FPS_WINDOW];
+    static int n = 0;
+
+    samples[n++] = frame_ns;
+    if (n < SIGIL_FPS_WINDOW) return;
+
+    uint64_t sum = 0, mn = samples[0], mx = samples[0];
+    for (int i = 0; i < SIGIL_FPS_WINDOW; i++) {
+        sum += samples[i];
+        if (samples[i] < mn) mn = samples[i];
+        if (samples[i] > mx) mx = samples[i];
+    }
+    /* p99 via simple insertion sort on a copy (N=120, fine) */
+    uint64_t sorted[SIGIL_FPS_WINDOW];
+    memcpy(sorted, samples, sizeof sorted);
+    for (int i = 1; i < SIGIL_FPS_WINDOW; i++) {
+        uint64_t k = sorted[i]; int j = i - 1;
+        while (j >= 0 && sorted[j] > k) { sorted[j+1] = sorted[j]; j--; }
+        sorted[j+1] = k;
+    }
+    uint64_t p99 = sorted[(SIGIL_FPS_WINDOW * 99) / 100];
+
+    double avg_ms = (double)sum / SIGIL_FPS_WINDOW / 1e6;
+    double fps    = 1e9 * SIGIL_FPS_WINDOW / (double)sum;
+    fprintf(stderr,
+        "frame: avg %6.2f ms (%6.1f fps)  min %6.2f  max %6.2f  p99 %6.2f\n",
+        avg_ms, fps, (double)mn / 1e6, (double)mx / 1e6, (double)p99 / 1e6);
+    n = 0;
+}
+
 static void render_frame(ViewerCtx *ctx)
 {
     WGPUDevice device = ctx->base.device;
     WGPUQueue  queue  = ctx->base.queue;
+
+    uint64_t t0 = nanoTime();
 
     glfwPollEvents();
 
@@ -291,15 +360,157 @@ static void render_frame(ViewerCtx *ctx)
     wgpuTextureViewRelease(sv);
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
+
+    fps_tick(nanoTime() - t0);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Main                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/*  Capture mode: render one frame to an offscreen texture and PNG it. */
+/*  Uses the viewer's exact UBO math (update_ubo) so we can diagnose   */
+/*  any discrepancy between interactive vs headless output.            */
+/* ------------------------------------------------------------------ */
+
+static volatile int g_cap_mapped = 0;
+static void cap_map_cb(WGPUMapAsyncStatus status, WGPUStringView msg,
+                        void *u1, void *u2)
+{
+    (void)msg; (void)u1; (void)u2;
+    g_cap_mapped = (status == WGPUMapAsyncStatus_Success) ? 1 : -1;
+}
+
+static int capture_frame(ViewerCtx *ctx, int W, int H, const char *outPath,
+                          float zoom, float camX, float camY)
+{
+    WGPUDevice device = ctx->base.device;
+    WGPUQueue  queue  = ctx->base.queue;
+
+    /* Build draw data at the capture size */
+    if (ctx->drawData) { sigil_free_draw_data(ctx->drawData); ctx->drawData = NULL; }
+    ctx->gpuScene = sigil_upload(ctx->sigil, ctx->scene);
+    WGPUCommandEncoder prepEnc = wgpuDeviceCreateCommandEncoder(device, NULL);
+    ctx->drawData = sigil_prepare_gpu(ctx->sigil, ctx->gpuScene, prepEnc,
+                                       (float)W, (float)H);
+    WGPUCommandBuffer prepCb = wgpuCommandEncoderFinish(prepEnc, NULL);
+    wgpuQueueSubmit(queue, 1, &prepCb);
+    wgpuCommandBufferRelease(prepCb);
+    wgpuCommandEncoderRelease(prepEnc);
+    if (!ctx->drawData) { fprintf(stderr, "capture: sigil_prepare_gpu failed\n"); return 1; }
+
+    /* Apply the viewer's default camera (cam centered, zoom=1) via update_ubo
+       — same math as interactive path. Note update_ubo uses glfwGetWindowSize,
+       so temporarily resize the window to (W,H) before calling. */
+    glfwSetWindowSize(ctx->base.window, W, H);
+    ctx->cam_x = (camX >= 0) ? camX : (float)W * 0.5f;
+    ctx->cam_y = (camY >= 0) ? camY : (float)H * 0.5f;
+    ctx->zoom  = zoom;
+    update_ubo(ctx);
+
+    /* Use BGRA8Unorm to match the interactive pipeline byte-for-byte */
+    WGPUTextureFormat fmt = WGPUTextureFormat_BGRA8Unorm;
+    WGPUTexture rtTex = wgpuDeviceCreateTexture(device,
+        &(WGPUTextureDescriptor){
+            .usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
+            .dimension = WGPUTextureDimension_2D,
+            .size = {(uint32_t)W, (uint32_t)H, 1},
+            .format = fmt,
+            .mipLevelCount = 1, .sampleCount = 1,
+        });
+    WGPUTextureView rtView = wgpuTextureCreateView(rtTex,
+        &(WGPUTextureViewDescriptor){
+            .format = fmt,
+            .dimension = WGPUTextureViewDimension_2D,
+            .mipLevelCount = 1, .arrayLayerCount = 1,
+            .aspect = WGPUTextureAspect_All,
+            .usage = WGPUTextureUsage_RenderAttachment,
+        });
+
+    uint32_t rowBytes   = (uint32_t)W * 4;
+    uint32_t alignedRow = (rowBytes + 255) & ~255u;
+    WGPUBuffer readBuf  = wgpuDeviceCreateBuffer(device,
+        &(WGPUBufferDescriptor){
+            .size  = (uint64_t)alignedRow * (uint64_t)H,
+            .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+        });
+    {
+        size_t rbSize = (size_t)alignedRow * (size_t)H;
+        void *z = calloc(1, rbSize);
+        wgpuQueueWriteBuffer(queue, readBuf, 0, z, rbSize);
+        free(z);
+    }
+
+    static const float bg[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, NULL);
+    sigil_encode(ctx->sigil, ctx->drawData, enc, rtView, NULL, bg);
+    wgpuCommandEncoderCopyTextureToBuffer(enc,
+        &(WGPUTexelCopyTextureInfo){.texture = rtTex, .aspect = WGPUTextureAspect_All},
+        &(WGPUTexelCopyBufferInfo){.buffer = readBuf,
+            .layout = {.bytesPerRow = alignedRow, .rowsPerImage = (uint32_t)H}},
+        &(WGPUExtent3D){(uint32_t)W, (uint32_t)H, 1});
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
+    wgpuQueueSubmit(queue, 1, &cb);
+
+    WGPUBufferMapCallbackInfo mi = { .callback = cap_map_cb, .mode = WGPUCallbackMode_WaitAnyOnly };
+    WGPUFuture mf = wgpuBufferMapAsync(readBuf, WGPUMapMode_Read, 0,
+                                        (size_t)alignedRow * H, mi);
+    WGPUFutureWaitInfo wi = { .future = mf };
+    wgpuInstanceWaitAny(ctx->base.instance, 1, &wi, UINT64_MAX);
+    if (g_cap_mapped != 1) { fprintf(stderr, "capture: map failed\n"); return 1; }
+
+    const uint8_t *mapped = (const uint8_t *)wgpuBufferGetMappedRange(readBuf, 0,
+                                   (size_t)alignedRow * H);
+    /* BGRA -> RGBA swap for PNG */
+    uint8_t *rgba = (uint8_t *)malloc((size_t)W * (size_t)H * 4);
+    for (int y = 0; y < H; y++) {
+        const uint8_t *src = mapped + y * alignedRow;
+        uint8_t *dst = rgba + y * W * 4;
+        for (int x = 0; x < W; x++) {
+            dst[x*4+0] = src[x*4+2];
+            dst[x*4+1] = src[x*4+1];
+            dst[x*4+2] = src[x*4+0];
+            dst[x*4+3] = src[x*4+3];
+        }
+    }
+    stbi_write_png(outPath, W, H, 4, rgba, W * 4);
+    fprintf(stderr, "Captured %dx%d -> %s\n", W, H, outPath);
+    free(rgba);
+
+    wgpuBufferUnmap(readBuf);
+    wgpuBufferDestroy(readBuf);
+    wgpuBufferRelease(readBuf);
+    wgpuTextureViewRelease(rtView);
+    wgpuTextureDestroy(rtTex);
+    wgpuTextureRelease(rtTex);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(enc);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    const char *inputPath = argc >= 2 ? argv[1] : NULL;
+    const char *inputPath = NULL;
+    const char *capturePath = NULL;
+    int capW = 900, capH = 900;
+    float capZoom = 1.0f;
+    float capCamX = -1.0f, capCamY = -1.0f; /* -1 = center */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) {
+            capturePath = argv[++i];
+        } else if (strcmp(argv[i], "--size") == 0 && i + 2 < argc) {
+            capW = atoi(argv[++i]);
+            capH = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--zoom") == 0 && i + 1 < argc) {
+            capZoom = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--cam") == 0 && i + 2 < argc) {
+            capCamX = (float)atof(argv[++i]);
+            capCamY = (float)atof(argv[++i]);
+        } else if (argv[i][0] != '-') {
+            inputPath = argv[i];
+        }
+    }
 
     /* Load or use default SVG */
     char *svgBuf = NULL;
@@ -312,9 +523,16 @@ int main(int argc, char **argv)
         svgData = svgBuf;
         fprintf(stderr, "Input:  %s (%zu bytes)\n", inputPath, svgLen);
     } else {
-        svgData = DEFAULT_SVG;
-        svgLen  = strlen(DEFAULT_SVG);
-        fprintf(stderr, "Input:  <built-in test SVG>\n");
+        const char *found = NULL;
+        svgBuf = try_load_default_svg(&svgLen, &found);
+        if (svgBuf) {
+            svgData = svgBuf;
+            fprintf(stderr, "Input:  %s (%zu bytes) [default benchmark SVG]\n", found, svgLen);
+        } else {
+            svgData = DEFAULT_SVG;
+            svgLen  = strlen(DEFAULT_SVG);
+            fprintf(stderr, "Input:  <built-in test SVG>\n");
+        }
     }
 
     /* Parse SVG */
@@ -353,6 +571,16 @@ int main(int argc, char **argv)
     }
 
     ctx.scene = scene;
+
+    /* Capture mode: render one frame to PNG and exit */
+    if (capturePath) {
+        int rc = capture_frame(&ctx, capW, capH, capturePath, capZoom, capCamX, capCamY);
+        sigil_free_draw_data(ctx.drawData);
+        sigil_free_gpu_scene(ctx.gpuScene);
+        sigil_free_scene(ctx.scene);
+        sigil_destroy(ctx.sigil);
+        return rc;
+    }
 
     /* Initial draw data */
     int initW, initH;

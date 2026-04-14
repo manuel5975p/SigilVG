@@ -27,21 +27,20 @@
 /*  Test harness                                                      */
 /* ------------------------------------------------------------------ */
 
-#include <setjmp.h>
+static int g_pass = 0, g_fail = 0;
 
-static jmp_buf g_jmpbuf;
-
-int sigil_run_test(void (*fn)(void)) {
-    if (setjmp(g_jmpbuf) == 0) { fn(); return 0; }
-    return 1;
-}
-
-#define TEST(name) void name(void)
+#define TEST(name) static void name(void)
 #define ASSERT(cond) do { \
     if (!(cond)) { \
         fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        longjmp(g_jmpbuf, 1); \
+        g_fail++; return; \
     } \
+} while(0)
+#define RUN(name) do { \
+    int _prev_fail = g_fail; \
+    printf("  %-40s", #name "..."); fflush(stdout); name(); \
+    if (g_fail == _prev_fail) { printf(" ok\n"); g_pass++; } \
+    else { printf(" FAILED\n"); } \
 } while(0)
 
 /* ------------------------------------------------------------------ */
@@ -105,7 +104,7 @@ static void on_device(WGPURequestDeviceStatus s, WGPUDevice d,
 static GPU g_gpu = {0};
 static SigilContext *g_sigil = NULL;
 
-int sigil_ref_gpu_init(void) {
+static int gpu_init(void) {
     if (g_gpu.device) return 1; /* already init */
 
     WGPUInstanceFeatureName feats[] = {
@@ -152,7 +151,7 @@ static void map_cb(WGPUMapAsyncStatus status, WGPUStringView msg, void *u1, void
 
 static int sigil_render(const char *svg, int w, int h, Image *out) {
     memset(out, 0, sizeof(*out));
-    if (!sigil_ref_gpu_init()) return 0;
+    if (!gpu_init()) return 0;
 
     SigilScene *scene = sigil_parse_svg(svg, strlen(svg));
     if (!scene || scene->element_count == 0) { sigil_free_scene(scene); return 0; }
@@ -751,3 +750,82 @@ TEST(test_cmp_heart) {
     ASSERT(compare_svg("heart", svg, 200, 200));
 }
 
+/* ------------------------------------------------------------------ */
+/*  Main                                                              */
+/* ------------------------------------------------------------------ */
+
+int main(void) {
+    printf("SigilVG vs PlutoSVG comparison tests\n");
+    printf("  PlutoSVG %s / PlutoVG %s\n\n", plutosvg_version_string(), plutovg_version_string());
+
+    /* Init GPU once */
+    if (!gpu_init()) {
+        fprintf(stderr, "ERROR: GPU init failed, cannot run comparison tests\n");
+        return 1;
+    }
+    printf("  GPU initialized\n\n");
+
+    printf("-- Basic fills --\n");
+    RUN(test_cmp_solid_rect);
+    RUN(test_cmp_blue_circle);
+    RUN(test_cmp_green_ellipse);
+    RUN(test_cmp_triangle_path);
+    RUN(test_cmp_polygon_star);
+
+    printf("\n-- Path commands --\n");
+    RUN(test_cmp_cubic_bezier);
+    RUN(test_cmp_quadratic_bezier);
+    RUN(test_cmp_smooth_cubic);
+    RUN(test_cmp_arc);
+    RUN(test_cmp_arc_large);
+    RUN(test_cmp_hv_lines);
+
+    printf("\n-- Fill rules --\n");
+    RUN(test_cmp_evenodd_star);
+    RUN(test_cmp_nonzero_star);
+
+    printf("\n-- Strokes --\n");
+    RUN(test_cmp_stroke_line);
+    RUN(test_cmp_stroke_rect);
+    RUN(test_cmp_fill_and_stroke);
+    RUN(test_cmp_polyline_stroke);
+
+    printf("\n-- Transforms --\n");
+    RUN(test_cmp_translate);
+    RUN(test_cmp_scale);
+    RUN(test_cmp_rotate);
+    RUN(test_cmp_nested_transforms);
+    RUN(test_cmp_matrix_transform);
+
+    printf("\n-- Opacity --\n");
+    RUN(test_cmp_opacity);
+    RUN(test_cmp_overlapping_opacity);
+
+    printf("\n-- viewBox --\n");
+    RUN(test_cmp_viewbox_scale_up);
+    RUN(test_cmp_viewbox_scale_down);
+
+    printf("\n-- Colors --\n");
+    RUN(test_cmp_named_colors);
+    RUN(test_cmp_hex_colors);
+
+    printf("\n-- Composition --\n");
+    RUN(test_cmp_multi_shapes);
+    RUN(test_cmp_complex_scene);
+    RUN(test_cmp_circles_grid);
+
+    printf("\n-- Edge cases --\n");
+    RUN(test_cmp_tiny_shape);
+    RUN(test_cmp_large_circle);
+    RUN(test_cmp_concentric_circles);
+    RUN(test_cmp_adjacent_rects);
+
+    printf("\n-- Complex shapes --\n");
+    RUN(test_cmp_diamond);
+    RUN(test_cmp_heart);
+
+    printf("\n%d passed, %d failed\n", g_pass, g_fail);
+
+    if (g_sigil) sigil_destroy(g_sigil);
+    return g_fail > 0 ? 1 : 0;
+}
